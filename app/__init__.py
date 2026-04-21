@@ -1,0 +1,1 @@
+"""SoundWeaver application package."""
