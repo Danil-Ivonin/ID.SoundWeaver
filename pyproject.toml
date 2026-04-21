@@ -3,7 +3,7 @@ name = "id-soundweaver"
 version = "0.1.0"
 description = "GPU speech-to-text microservice with optional speaker diarization."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = "==3.12.*"
 dependencies = [
     "hydra-core",
     "omegaconf",

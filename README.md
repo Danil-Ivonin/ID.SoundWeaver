@@ -14,6 +14,8 @@ Planned production stack:
 
 The first version targets recordings up to 5 minutes long and returns either plain transcription text or speaker-labeled utterances.
 
+This service requires a minimum of `880 MB` of video memory for stable operation.
+
 ## Development
 
 Copy `.env.example` to `.env`, fill `HF_TOKEN`, then start services:
