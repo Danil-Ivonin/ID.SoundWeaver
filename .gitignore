@@ -203,7 +203,8 @@ marimo/_lsp/
 __marimo__/
 
 # Superpowers
-docs/superpowers/
+.codex
+docs/superpowers/plans/
 .worktrees/
 
 # Temporary files
