@@ -8,6 +8,7 @@ from app.main import create_app
 class FakeJobRepo:
     def __init__(self):
         self.jobs = {}
+        self.created = True
 
     def get_upload(self, upload_id):
         if upload_id == "missing":
@@ -18,6 +19,10 @@ class FakeJobRepo:
         job = type("Job", (), {"id": kwargs["job_id"], "status": "queued"})
         self.jobs[job.id] = job
         return job
+
+    def get_or_create_job(self, **kwargs):
+        job = self.create_job(**kwargs)
+        return job, self.created
 
     def get_job(self, job_id):
         if job_id == "completed":
@@ -55,10 +60,16 @@ class FakeQueue:
         self.enqueued.append(job_id)
 
 
+class FakeStorage:
+    def object_exists(self, object_key):
+        return True
+
+
 def test_create_transcription_enqueues_job():
     app = create_app()
     app.state.job_repo = FakeJobRepo()
     app.state.queue = FakeQueue()
+    app.state.storage = FakeStorage()
     app.state.new_id = lambda: "job_1"
     client = TestClient(app)
 
@@ -83,3 +94,23 @@ def test_get_completed_transcription_returns_empty_utterances_without_diarizatio
     assert response.json()["status"] == "completed"
     assert response.json()["utterances"] == []
     assert response.json()["diagnostics"] == {"emotions": {"neutral": 0.7}}
+
+
+def test_create_transcription_does_not_enqueue_existing_duplicate_job():
+    app = create_app()
+    repo = FakeJobRepo()
+    repo.created = False
+    app.state.job_repo = repo
+    app.state.queue = FakeQueue()
+    app.state.storage = FakeStorage()
+    app.state.new_id = lambda: "job_1"
+    client = TestClient(app)
+
+    response = client.post(
+        "/v1/transcriptions",
+        json={"upload_id": "upload_1", "diarization": True, "min_speakers": 1, "max_speakers": 5},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"job_id": "job_1", "status": "queued"}
+    assert app.state.queue.enqueued == []

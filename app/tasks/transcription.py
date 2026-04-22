@@ -1,17 +1,29 @@
+import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
 
 import torch
+import torchaudio
+from celery import chord
+from celery.exceptions import Retry
 
-from app.alignment import build_utterances
+from app.alignment import SpeakerSegment, WordTimestamp, build_utterances
 from app.asr.gigaam_service import GigaAMEmotionService, GigaAMService
 from app.audio.processing import normalize_audio
-from app.db.repositories import get_job, mark_job_completed, mark_job_failed, mark_job_processing
+from app.db.repositories import (
+    claim_job_processing,
+    get_job,
+    get_task_results,
+    mark_job_completed,
+    mark_job_failed,
+    upsert_task_result,
+)
 from app.db.session import SessionLocal
 from app.diarization.pyannote_service import PyannoteDiarizationService
 from app.errors import AppError, ErrorCode
 from app.settings import get_settings
+from app.storage.minio import AsyncS3Storage
 from app.tasks.celery_app import celery_app
 
 
@@ -60,7 +72,11 @@ class TranscriptionProcessor:
         audio = self.audio_processor.normalize(input_path, normalized_path)
 
         asr_started_at = self.clock()
-        text, words = self.asr.transcribe(audio.path, word_timestamps=diarization)
+        text, words = self.asr.transcribe(
+            audio.path,
+            word_timestamps=diarization,
+            duration_sec=audio.duration_sec,
+        )
         asr_duration_sec = self.clock() - asr_started_at
         emotions = self.emotion_model.get_probs(audio.path)
 
@@ -97,40 +113,281 @@ def assert_cuda_available() -> None:
         raise AppError(ErrorCode.CUDA_UNAVAILABLE, "CUDA is not available")
 
 
-@celery_app.task(name="transcribe_audio")
-def transcribe_audio(job_id: str) -> None:
+async def _mark_failed(job_id: str, error_code: str, error_message: str) -> None:
+    async with SessionLocal() as session:
+        await mark_job_failed(session, job_id, error_code, error_message)
+
+
+async def _record_task_success(job_id: str, task_type: str, payload: dict) -> None:
+    async with SessionLocal() as session:
+        await upsert_task_result(
+            session,
+            job_id=job_id,
+            task_type=task_type,
+            status="completed",
+            payload=payload,
+        )
+
+
+async def _record_task_failure(job_id: str, task_type: str, error_code: str, error_message: str) -> None:
+    async with SessionLocal() as session:
+        await upsert_task_result(
+            session,
+            job_id=job_id,
+            task_type=task_type,
+            status="failed",
+            payload={},
+            error_code=error_code,
+            error_message=error_message,
+        )
+        await mark_job_failed(session, job_id, error_code, error_message)
+
+
+def _word_to_payload(word: WordTimestamp) -> dict:
+    return {"text": word.text, "start": word.start, "end": word.end}
+
+
+def _word_from_payload(payload: dict) -> WordTimestamp:
+    return WordTimestamp(
+        text=payload["text"],
+        start=float(payload["start"]),
+        end=float(payload["end"]),
+    )
+
+
+def _segment_to_payload(segment: SpeakerSegment) -> dict:
+    return {"speaker": segment.speaker, "start": segment.start, "end": segment.end}
+
+
+def _segment_from_payload(payload: dict) -> SpeakerSegment:
+    return SpeakerSegment(
+        speaker=payload["speaker"],
+        start=float(payload["start"]),
+        end=float(payload["end"]),
+    )
+
+
+async def _prepare_transcription_job(job_id: str) -> None:
     settings = get_settings()
-    assert_cuda_available()
-    with SessionLocal() as session:
-        job = get_job(session, job_id)
+    async with SessionLocal() as session:
+        claimed = await claim_job_processing(session, job_id)
+        if not claimed:
+            return
+        job = await get_job(session, job_id)
         if job is None:
             return
-        mark_job_processing(session, job_id)
-        try:
-            with TemporaryDirectory() as tmp:
-                from app.main import RuntimeStorage
 
-                processor = TranscriptionProcessor(
-                    storage=RuntimeStorage(settings),
-                    audio_processor=TorchaudioProcessor(settings.max_audio_duration_sec),
-                    asr=GigaAMService(settings.gigaam_model),
-                    diarization=PyannoteDiarizationService(
-                        settings.pyannote_model,
-                        settings.hf_token,
-                        settings.device,
-                    ),
-                    emotion_model=GigaAMEmotionService(),
-                    work_dir=Path(tmp),
-                )
-                result = processor.process(
-                    object_key=job.upload.object_key,
-                    diarization=job.diarization,
-                    num_speakers=job.num_speakers,
-                    min_speakers=job.min_speakers,
-                    max_speakers=job.max_speakers,
-                )
-            mark_job_completed(session, job_id=job_id, **result)
-        except AppError as exc:
-            mark_job_failed(session, job_id, exc.code.value, exc.message)
-        except Exception as exc:
-            mark_job_failed(session, job_id, ErrorCode.INTERNAL_ERROR.value, str(exc))
+        object_key = job.upload.object_key
+        diarization = job.diarization
+        num_speakers = job.num_speakers
+        min_speakers = job.min_speakers
+        max_speakers = job.max_speakers
+
+    storage = AsyncS3Storage(settings)
+    artifact_key = storage.build_normalized_artifact_key(job_id)
+    with TemporaryDirectory() as tmp:
+        work_dir = Path(tmp)
+        input_path = work_dir / "input_audio"
+        normalized_path = work_dir / "normalized.wav"
+        await storage.download_to_file(object_key, input_path)
+        audio = normalize_audio(input_path, normalized_path, settings.max_audio_duration_sec)
+        await storage.upload_file(normalized_path, artifact_key)
+
+    header = [
+        run_asr.s(job_id, artifact_key, diarization, audio.duration_sec),
+        run_emotions.s(job_id, artifact_key),
+    ]
+    if diarization:
+        header.append(
+            run_diarization.s(
+                job_id,
+                artifact_key,
+                num_speakers,
+                min_speakers,
+                max_speakers,
+            )
+        )
+    chord(header)(aggregate_transcription_job.s(job_id))
+
+
+@celery_app.task(name="prepare_transcription_job")
+def prepare_transcription_job(job_id: str) -> None:
+    try:
+        asyncio.run(_prepare_transcription_job(job_id))
+    except AppError as exc:
+        asyncio.run(_mark_failed(job_id, exc.code.value, exc.message))
+    except Exception as exc:
+        asyncio.run(_mark_failed(job_id, ErrorCode.INTERNAL_ERROR.value, str(exc)))
+
+
+@celery_app.task(name="run_asr")
+def run_asr(job_id: str, normalized_object_key: str, word_timestamps: bool, duration_sec: float) -> dict:
+    task_type = "asr"
+    started_at = perf_counter()
+    try:
+        assert_cuda_available()
+        settings = get_settings()
+        storage = AsyncS3Storage(settings)
+        with TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "normalized.wav"
+            asyncio.run(storage.download_to_file(normalized_object_key, audio_path))
+            text, words = GigaAMService(settings.gigaam_model).transcribe(
+                audio_path,
+                word_timestamps=word_timestamps,
+                duration_sec=duration_sec,
+            )
+        payload = {
+            "text": text,
+            "words": [_word_to_payload(word) for word in words],
+            "duration_sec": duration_sec,
+            "asr_duration_sec": round(perf_counter() - started_at, 3),
+        }
+        asyncio.run(_record_task_success(job_id, task_type, payload))
+        return {"task_type": task_type, "status": "completed"}
+    except AppError as exc:
+        asyncio.run(_record_task_failure(job_id, task_type, exc.code.value, exc.message))
+        raise
+    except Exception as exc:
+        asyncio.run(_record_task_failure(job_id, task_type, ErrorCode.ASR_FAILED.value, str(exc)))
+        raise
+
+
+@celery_app.task(name="run_diarization")
+def run_diarization(
+    job_id: str,
+    normalized_object_key: str,
+    num_speakers: int | None,
+    min_speakers: int | None,
+    max_speakers: int | None,
+) -> dict:
+    task_type = "diarization"
+    started_at = perf_counter()
+    try:
+        assert_cuda_available()
+        settings = get_settings()
+        storage = AsyncS3Storage(settings)
+        with TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "normalized.wav"
+            asyncio.run(storage.download_to_file(normalized_object_key, audio_path))
+            waveform, sample_rate = torchaudio.load(str(audio_path))
+            segments = PyannoteDiarizationService(
+                settings.pyannote_model,
+                settings.hf_token,
+                settings.device,
+            ).diarize(
+                waveform=waveform,
+                sample_rate=sample_rate,
+                num_speakers=num_speakers,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+            )
+        payload = {
+            "segments": [_segment_to_payload(segment) for segment in segments],
+            "diarization_duration_sec": round(perf_counter() - started_at, 3),
+        }
+        asyncio.run(_record_task_success(job_id, task_type, payload))
+        return {"task_type": task_type, "status": "completed"}
+    except AppError as exc:
+        asyncio.run(_record_task_failure(job_id, task_type, exc.code.value, exc.message))
+        raise
+    except Exception as exc:
+        asyncio.run(_record_task_failure(job_id, task_type, ErrorCode.DIARIZATION_FAILED.value, str(exc)))
+        raise
+
+
+@celery_app.task(name="run_emotions")
+def run_emotions(job_id: str, normalized_object_key: str) -> dict:
+    task_type = "emotions"
+    started_at = perf_counter()
+    try:
+        assert_cuda_available()
+        settings = get_settings()
+        storage = AsyncS3Storage(settings)
+        with TemporaryDirectory() as tmp:
+            audio_path = Path(tmp) / "normalized.wav"
+            asyncio.run(storage.download_to_file(normalized_object_key, audio_path))
+            emotions = GigaAMEmotionService().get_probs(audio_path)
+        payload = {
+            "emotions": emotions,
+            "emotions_duration_sec": round(perf_counter() - started_at, 3),
+        }
+        asyncio.run(_record_task_success(job_id, task_type, payload))
+        return {"task_type": task_type, "status": "completed"}
+    except AppError as exc:
+        asyncio.run(_record_task_failure(job_id, task_type, exc.code.value, exc.message))
+        raise
+    except Exception as exc:
+        asyncio.run(_record_task_failure(job_id, task_type, ErrorCode.INTERNAL_ERROR.value, str(exc)))
+        raise
+
+
+async def _aggregate_transcription_job(job_id: str) -> bool:
+    async with SessionLocal() as session:
+        job = await get_job(session, job_id)
+        if job is None or job.status == "failed":
+            return True
+
+        results = await get_task_results(session, job_id)
+        required = {"asr", "emotions"}
+        if job.diarization:
+            required.add("diarization")
+        if not required.issubset(results):
+            return False
+
+        failed = [result for result in results.values() if result.status == "failed"]
+        if failed:
+            first = failed[0]
+            await mark_job_failed(
+                session,
+                job_id,
+                first.error_code or ErrorCode.INTERNAL_ERROR.value,
+                first.error_message or "Transcription child task failed",
+            )
+            return True
+
+        asr_payload = results["asr"].payload
+        emotion_payload = results["emotions"].payload
+        words = [_word_from_payload(item) for item in asr_payload.get("words", [])]
+        segments = []
+        diarization_duration_sec = 0.0
+        if job.diarization:
+            diarization_payload = results["diarization"].payload
+            segments = [_segment_from_payload(item) for item in diarization_payload.get("segments", [])]
+            diarization_duration_sec = diarization_payload.get("diarization_duration_sec", 0.0)
+
+        utterances = build_utterances(words, segments) if segments else []
+        diagnostics = {
+            "device": get_settings().device,
+            "asr_duration_sec": asr_payload.get("asr_duration_sec", 0.0),
+            "diarization_duration_sec": diarization_duration_sec,
+            "emotions_duration_sec": emotion_payload.get("emotions_duration_sec", 0.0),
+            "emotions": emotion_payload.get("emotions", {}),
+        }
+        await mark_job_completed(
+            session,
+            job_id=job_id,
+            duration_sec=asr_payload["duration_sec"],
+            text=asr_payload["text"],
+            utterances=utterances,
+            diagnostics=diagnostics,
+        )
+        return True
+
+
+@celery_app.task(bind=True, name="aggregate_transcription_job", max_retries=12, default_retry_delay=5)
+def aggregate_transcription_job(self, _child_results, job_id: str) -> None:
+    try:
+        complete = asyncio.run(_aggregate_transcription_job(job_id))
+        if not complete:
+            raise self.retry(countdown=5)
+    except Retry:
+        raise
+    except AppError as exc:
+        asyncio.run(_mark_failed(job_id, exc.code.value, exc.message))
+    except Exception as exc:
+        asyncio.run(_mark_failed(job_id, ErrorCode.INTERNAL_ERROR.value, str(exc)))
+
+
+@celery_app.task(name="transcribe_audio")
+def transcribe_audio(job_id: str) -> None:
+    prepare_transcription_job.delay(job_id)

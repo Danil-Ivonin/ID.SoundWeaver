@@ -22,7 +22,11 @@ class FakeAudioProcessor:
 
 
 class FakeAsr:
-    def transcribe(self, audio_path, *, word_timestamps):
+    def __init__(self):
+        self.duration_sec = None
+
+    def transcribe(self, audio_path, *, word_timestamps, duration_sec=None):
+        self.duration_sec = duration_sec
         return "hello world", [
             WordTimestamp(text="hello", start=0.0, end=0.5),
             WordTimestamp(text="world", start=0.5, end=1.0),
@@ -53,10 +57,11 @@ class FakeClock:
 
 def test_processor_returns_empty_utterances_without_diarization(tmp_path):
     emotion_model = FakeEmotionModel()
+    asr = FakeAsr()
     processor = TranscriptionProcessor(
         storage=FakeStorage(),
         audio_processor=FakeAudioProcessor(),
-        asr=FakeAsr(),
+        asr=asr,
         diarization=FakeDiarization(),
         emotion_model=emotion_model,
         work_dir=tmp_path,
@@ -78,6 +83,7 @@ def test_processor_returns_empty_utterances_without_diarization(tmp_path):
     assert result["diagnostics"]["total_processing_sec"] == 4.5
     assert result["diagnostics"]["emotions"] == {"neutral": 0.7, "happy": 0.3}
     assert emotion_model.audio_path == FakeAudio.path
+    assert asr.duration_sec == FakeAudio.duration_sec
 
 
 def test_processor_returns_speaker_utterances_with_diarization(tmp_path):

@@ -12,6 +12,7 @@ def create_celery_app() -> Celery:
         include=["app.tasks.transcription"],
     )
     celery_app.conf.task_track_started = True
+    celery_app.conf.result_extended = True
     return celery_app
 
 

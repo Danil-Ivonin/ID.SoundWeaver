@@ -7,7 +7,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    database_url: str = "postgresql+psycopg://soundweaver:soundweaver@localhost:5432/soundweaver"
+    database_url: str = "postgresql+asyncpg://soundweaver:soundweaver@localhost:5432/soundweaver"
     redis_url: str = "redis://localhost:6379/0"
 
     minio_endpoint: str = "localhost:9000"
@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     device: str = "cuda"
 
     max_upload_size_bytes: int = Field(default=104_857_600, ge=1)
-    max_audio_duration_sec: int = Field(default=300, ge=1)
+    max_audio_duration_sec: int = Field(default=3600, ge=1)
     presigned_upload_ttl_sec: int = Field(default=900, ge=60)
 
 

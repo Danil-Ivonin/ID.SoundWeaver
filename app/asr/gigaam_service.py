@@ -6,6 +6,8 @@ from app.alignment import WordTimestamp
 
 
 class GigaAMService:
+    LONGFORM_THRESHOLD_SEC = 30.0
+
     def __init__(self, model_name: str) -> None:
         self.model_name = model_name
         self.model = gigaam.load_model(model_name)
@@ -15,8 +17,13 @@ class GigaAMService:
         audio_path: Path,
         *,
         word_timestamps: bool,
+        duration_sec: float | None = None,
     ) -> tuple[str, list[WordTimestamp]]:
-        result = self.model.transcribe(str(audio_path), word_timestamps=word_timestamps)
+        method = self.model.transcribe
+        if duration_sec is not None and duration_sec > self.LONGFORM_THRESHOLD_SEC:
+            method = self.model.transcribe_longform
+
+        result = method(str(audio_path), word_timestamps=word_timestamps)
         if isinstance(result, str):
             return result, []
 

@@ -5,6 +5,8 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      MPLCONFIGDIR: /tmp/matplotlib
     ports:
       - "8000:8000"
     depends_on:
@@ -14,10 +16,12 @@ services:
 
   worker:
     build: .
-    command: celery -A app.tasks.celery_app.celery_app worker --loglevel=INFO --concurrency=1 --pool=solo
+    command: celery -A app.tasks.celery_app.celery_app worker --loglevel=INFO --concurrency=3
     env_file:
       - path: .env
         required: false
+    environment:
+      MPLCONFIGDIR: /tmp/matplotlib
     deploy:
       resources:
         reservations:

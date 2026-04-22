@@ -2,6 +2,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request, status
 
+from app.async_utils import maybe_await
 from app.errors import ErrorCode
 from app.schemas import (
     CreateTranscriptionRequest,
@@ -18,30 +19,47 @@ def new_id() -> str:
 
 
 @router.post("", response_model=CreateTranscriptionResponse)
-def create_transcription(payload: CreateTranscriptionRequest, request: Request):
-    upload = request.app.state.job_repo.get_upload(payload.upload_id)
+async def create_transcription(payload: CreateTranscriptionRequest, request: Request):
+    upload = await maybe_await(request.app.state.job_repo.get_upload(payload.upload_id))
     if upload is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": ErrorCode.UPLOAD_NOT_FOUND, "message": "Upload not found"},
         )
 
+    if hasattr(request.app.state.storage, "object_exists"):
+        exists = await maybe_await(request.app.state.storage.object_exists(upload.object_key))
+        if not exists:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": ErrorCode.UPLOAD_NOT_COMPLETED,
+                    "message": "Upload object was not found in storage",
+                },
+            )
+
     job_id = request.app.state.new_id() if hasattr(request.app.state, "new_id") else new_id()
-    job = request.app.state.job_repo.create_job(
-        job_id=job_id,
-        upload_id=payload.upload_id,
-        diarization=payload.diarization,
-        num_speakers=payload.num_speakers,
-        min_speakers=payload.min_speakers,
-        max_speakers=payload.max_speakers,
-    )
-    request.app.state.queue.enqueue(job.id)
+    kwargs = {
+        "job_id": job_id,
+        "upload_id": payload.upload_id,
+        "diarization": payload.diarization,
+        "num_speakers": payload.num_speakers,
+        "min_speakers": payload.min_speakers,
+        "max_speakers": payload.max_speakers,
+    }
+    if hasattr(request.app.state.job_repo, "get_or_create_job"):
+        job, created = await maybe_await(request.app.state.job_repo.get_or_create_job(**kwargs))
+    else:
+        job = await maybe_await(request.app.state.job_repo.create_job(**kwargs))
+        created = True
+    if created:
+        await maybe_await(request.app.state.queue.enqueue(job.id))
     return CreateTranscriptionResponse(job_id=job.id, status=job.status)
 
 
 @router.get("/{job_id}", response_model=TranscriptionStatusResponse)
-def get_transcription(job_id: str, request: Request):
-    job = request.app.state.job_repo.get_job(job_id)
+async def get_transcription(job_id: str, request: Request):
+    job = await maybe_await(request.app.state.job_repo.get_job(job_id))
     if job is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

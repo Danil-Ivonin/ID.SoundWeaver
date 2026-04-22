@@ -11,6 +11,7 @@ This change covers:
 - async FastAPI endpoints for uploads and transcriptions;
 - async SQLAlchemy sessions and repositories;
 - async S3-compatible storage operations;
+- a default maximum normalized audio duration of 1 hour;
 - a Celery workflow with separate ASR, diarization, and emotion tasks;
 - safe aggregation of parallel task outputs into one public transcription result;
 - idempotent handling for duplicate HTTP requests and repeated Celery task delivery.
@@ -76,6 +77,8 @@ The workflow uses these task roles:
 - `aggregate_transcription_job(job_id)`: combines ASR, diarization, and emotion outputs into the final result.
 
 Celery tasks are still synchronous function entrypoints because Celery workers execute task functions, but each task may call async DB/storage helpers through a small `asyncio.run(...)` boundary when needed. Heavy ML calls remain normal blocking model calls inside their own Celery tasks. Parallelism comes from Celery executing separate tasks concurrently, not from `asyncio.gather` inside one process.
+
+ASR uses `model.transcribe(...)` for normalized audio up to 30 seconds and `model.transcribe_longform(...)` for normalized audio longer than 30 seconds. The same `word_timestamps` flag is passed to both calls so diarization alignment can consume word timestamps for long audio too.
 
 The compose worker command must allow actual parallel task execution. The current `--concurrency=1 --pool=solo` is incompatible with running child tasks in parallel in a single worker process. The worker configuration will be changed so multiple task executions can run at the same time. For GPU deployments, the recommended production shape is separate workers or queues per model family when one GPU cannot safely host all three models concurrently.
 

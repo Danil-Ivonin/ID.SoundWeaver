@@ -18,7 +18,7 @@ def test_settings_load_expected_env(monkeypatch):
     assert settings.minio_bucket == "audio"
     assert settings.device == "cuda"
     assert settings.max_upload_size_bytes == 104_857_600
-    assert settings.max_audio_duration_sec == 300
+    assert settings.max_audio_duration_sec == 3600
     assert settings.presigned_upload_ttl_sec == 900
 
 

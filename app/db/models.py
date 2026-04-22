@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -34,9 +34,11 @@ class Upload(Base):
 
 class TranscriptionJob(Base):
     __tablename__ = "transcription_jobs"
+    __table_args__ = (UniqueConstraint("request_key", name="uq_transcription_jobs_request_key"),)
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     upload_id: Mapped[str] = mapped_column(ForeignKey("uploads.id"), nullable=False)
+    request_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     diarization: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     num_speakers: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -51,6 +53,7 @@ class TranscriptionJob(Base):
 
     upload: Mapped[Upload] = relationship(back_populates="jobs")
     result: Mapped["TranscriptionResult | None"] = relationship(back_populates="job")
+    task_results: Mapped[list["TranscriptionTaskResult"]] = relationship(back_populates="job")
 
 
 class TranscriptionResult(Base):
@@ -64,3 +67,18 @@ class TranscriptionResult(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
     job: Mapped[TranscriptionJob] = relationship(back_populates="result")
+
+
+class TranscriptionTaskResult(Base):
+    __tablename__ = "transcription_task_results"
+
+    job_id: Mapped[str] = mapped_column(ForeignKey("transcription_jobs.id"), primary_key=True)
+    task_type: Mapped[str] = mapped_column(String(32), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict] = mapped_column(JsonDict, nullable=False, default=dict)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    job: Mapped[TranscriptionJob] = relationship(back_populates="task_results")
