@@ -20,4 +20,8 @@ dependencies = [
     "transformers==4.57.1",
     "torchcodec==0.7.0",
     "soundfile>=0.13.1",
+    "gigaam",
 ]
+
+[tool.uv.sources]
+gigaam = { git = "https://github.com/salute-developers/GigaAM.git" }
