@@ -1,12 +1,12 @@
 from pathlib import Path
 
+import gigaam
+
 from app.alignment import WordTimestamp
 
 
 class GigaAMService:
     def __init__(self, model_name: str) -> None:
-        import gigaam
-
         self.model_name = model_name
         self.model = gigaam.load_model(model_name)
 
@@ -26,3 +26,11 @@ class GigaAMService:
             for word in getattr(result, "words", [])
         ]
         return text, words
+
+
+class GigaAMEmotionService:
+    def __init__(self) -> None:
+        self.model = gigaam.load_model("emo")
+
+    def get_probs(self, audio_path: Path) -> dict:
+        return self.model.get_probs(str(audio_path))

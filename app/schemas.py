@@ -77,4 +77,5 @@ class TranscriptionStatusResponse(BaseModel):
     duration_sec: float | None = None
     text: str | None = None
     utterances: list[Utterance] | None = None
+    diagnostics: dict | None = None
     error: ErrorBody | None = None

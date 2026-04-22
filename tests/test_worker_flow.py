@@ -34,6 +34,15 @@ class FakeDiarization:
         return [SpeakerSegment(speaker="SPEAKER_00", start=0.0, end=1.0)]
 
 
+class FakeEmotionModel:
+    def __init__(self):
+        self.audio_path = None
+
+    def get_probs(self, audio_path):
+        self.audio_path = audio_path
+        return {"neutral": 0.7, "happy": 0.3}
+
+
 class FakeClock:
     def __init__(self, values):
         self.values = iter(values)
@@ -43,11 +52,13 @@ class FakeClock:
 
 
 def test_processor_returns_empty_utterances_without_diarization(tmp_path):
+    emotion_model = FakeEmotionModel()
     processor = TranscriptionProcessor(
         storage=FakeStorage(),
         audio_processor=FakeAudioProcessor(),
         asr=FakeAsr(),
         diarization=FakeDiarization(),
+        emotion_model=emotion_model,
         work_dir=tmp_path,
         clock=FakeClock([0.0, 1.0, 3.4, 4.5]),
     )
@@ -65,6 +76,8 @@ def test_processor_returns_empty_utterances_without_diarization(tmp_path):
     assert result["diagnostics"]["asr_duration_sec"] == 2.4
     assert result["diagnostics"]["diarization_duration_sec"] == 0.0
     assert result["diagnostics"]["total_processing_sec"] == 4.5
+    assert result["diagnostics"]["emotions"] == {"neutral": 0.7, "happy": 0.3}
+    assert emotion_model.audio_path == FakeAudio.path
 
 
 def test_processor_returns_speaker_utterances_with_diarization(tmp_path):
@@ -73,6 +86,7 @@ def test_processor_returns_speaker_utterances_with_diarization(tmp_path):
         audio_processor=FakeAudioProcessor(),
         asr=FakeAsr(),
         diarization=FakeDiarization(),
+        emotion_model=FakeEmotionModel(),
         work_dir=tmp_path,
         clock=FakeClock([0.0, 1.0, 3.4, 3.5, 5.3, 5.5]),
     )

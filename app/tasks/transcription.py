@@ -2,10 +2,14 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
 
+import torch
+
 from app.alignment import build_utterances
+from app.asr.gigaam_service import GigaAMEmotionService, GigaAMService
 from app.audio.processing import normalize_audio
 from app.db.repositories import get_job, mark_job_completed, mark_job_failed, mark_job_processing
 from app.db.session import SessionLocal
+from app.diarization.pyannote_service import PyannoteDiarizationService
 from app.errors import AppError, ErrorCode
 from app.settings import get_settings
 from app.tasks.celery_app import celery_app
@@ -27,6 +31,7 @@ class TranscriptionProcessor:
         audio_processor,
         asr,
         diarization,
+        emotion_model,
         work_dir: Path,
         clock=perf_counter,
     ) -> None:
@@ -34,6 +39,7 @@ class TranscriptionProcessor:
         self.audio_processor = audio_processor
         self.asr = asr
         self.diarization = diarization
+        self.emotion_model = emotion_model
         self.work_dir = work_dir
         self.clock = clock
 
@@ -56,6 +62,7 @@ class TranscriptionProcessor:
         asr_started_at = self.clock()
         text, words = self.asr.transcribe(audio.path, word_timestamps=diarization)
         asr_duration_sec = self.clock() - asr_started_at
+        emotions = self.emotion_model.get_probs(audio.path)
 
         utterances = []
         if diarization:
@@ -80,16 +87,12 @@ class TranscriptionProcessor:
                 "asr_duration_sec": round(asr_duration_sec, 3),
                 "diarization_duration_sec": round(diarization_duration_sec, 3),
                 "total_processing_sec": round(total_processing_sec, 3),
+                "emotions": emotions,
             },
         }
 
 
 def assert_cuda_available() -> None:
-    try:
-        import torch
-    except Exception as exc:
-        raise AppError(ErrorCode.CUDA_UNAVAILABLE, "PyTorch is not available") from exc
-
     if not torch.cuda.is_available():
         raise AppError(ErrorCode.CUDA_UNAVAILABLE, "CUDA is not available")
 
@@ -105,8 +108,6 @@ def transcribe_audio(job_id: str) -> None:
         mark_job_processing(session, job_id)
         try:
             with TemporaryDirectory() as tmp:
-                from app.asr.gigaam_service import GigaAMService
-                from app.diarization.pyannote_service import PyannoteDiarizationService
                 from app.main import RuntimeStorage
 
                 processor = TranscriptionProcessor(
@@ -118,6 +119,7 @@ def transcribe_audio(job_id: str) -> None:
                         settings.hf_token,
                         settings.device,
                     ),
+                    emotion_model=GigaAMEmotionService(),
                     work_dir=Path(tmp),
                 )
                 result = processor.process(

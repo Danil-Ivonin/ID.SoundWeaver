@@ -69,6 +69,7 @@ def get_transcription(job_id: str, request: Request):
             duration_sec=job.result.duration_sec,
             text=job.result.text,
             utterances=job.result.utterances,
+            diagnostics=job.result.diagnostics,
         )
 
     return TranscriptionStatusResponse(

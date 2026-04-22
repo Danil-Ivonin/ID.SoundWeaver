@@ -24,7 +24,12 @@ class FakeJobRepo:
             result = type(
                 "Result",
                 (),
-                {"duration_sec": 1.0, "text": "hello", "utterances": [], "diagnostics": {}},
+                {
+                    "duration_sec": 1.0,
+                    "text": "hello",
+                    "utterances": [],
+                    "diagnostics": {"emotions": {"neutral": 0.7}},
+                },
             )
             return type(
                 "Job",
@@ -77,3 +82,4 @@ def test_get_completed_transcription_returns_empty_utterances_without_diarizatio
     assert response.status_code == 200
     assert response.json()["status"] == "completed"
     assert response.json()["utterances"] == []
+    assert response.json()["diagnostics"] == {"emotions": {"neutral": 0.7}}

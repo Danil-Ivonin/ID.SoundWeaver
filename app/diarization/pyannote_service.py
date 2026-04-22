@@ -1,11 +1,11 @@
+import torch
+from pyannote.audio import Pipeline
+
 from app.alignment import SpeakerSegment
 
 
 class PyannoteDiarizationService:
     def __init__(self, model_name: str, token: str, device: str) -> None:
-        import torch
-        from pyannote.audio import Pipeline
-
         self.pipeline = Pipeline.from_pretrained(model_name, token=token)
         self.pipeline.to(torch.device(device))
 

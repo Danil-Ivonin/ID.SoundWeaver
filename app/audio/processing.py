@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+import torchaudio
+
 from app.errors import AppError, ErrorCode
 
 
@@ -13,11 +15,6 @@ class NormalizedAudio:
 
 
 def normalize_audio(input_path: Path, output_path: Path, max_duration_sec: int) -> NormalizedAudio:
-    try:
-        import torchaudio
-    except Exception as exc:
-        raise AppError(ErrorCode.AUDIO_DECODE_FAILED, "torchaudio is not available") from exc
-
     try:
         waveform, sample_rate = torchaudio.load(str(input_path))
     except Exception as exc:
