@@ -24,15 +24,14 @@ class GigaAMService:
             method = self.model.transcribe_longform
 
         result = method(str(audio_path), word_timestamps=word_timestamps)
-        if isinstance(result, str):
-            return result, []
+        if not word_timestamps:
+            return result.text, []
 
-        text = getattr(result, "text", str(result))
         words = [
             WordTimestamp(text=word.text, start=float(word.start), end=float(word.end))
-            for word in getattr(result, "words", [])
+            for word in result.words
         ]
-        return text, words
+        return result.text, words
 
 
 class GigaAMEmotionService:
