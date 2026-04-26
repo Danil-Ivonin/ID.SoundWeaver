@@ -261,6 +261,7 @@ def test_upsert_task_result_replaces_existing_payload():
                     task_type="asr",
                     status="completed",
                     payload={"text": "first"},
+                    exec_duration=1.25,
                 )
                 updated = await upsert_task_result(
                     session,
@@ -268,10 +269,12 @@ def test_upsert_task_result_replaces_existing_payload():
                     task_type="asr",
                     status="completed",
                     payload={"text": "second"},
+                    exec_duration=2.5,
                 )
         finally:
             await engine.dispose()
 
         assert updated.payload == {"text": "second"}
+        assert updated.exec_duration == 2.5
 
     asyncio.run(run())

@@ -25,3 +25,20 @@ docker compose up --build
 ```
 
 The API listens on `http://localhost:8000`. MinIO console listens on `http://localhost:9001`.
+
+The default development stack starts API, PostgreSQL, Redis, and MinIO. The Celery worker is placed behind the `gpu` profile because it requires an NVIDIA-enabled Docker runtime:
+
+```bash
+docker compose --profile gpu up --build
+```
+
+Database connection settings are configured through `DB_*` variables in `.env`:
+
+```env
+DB_DRIVER=postgresql+asyncpg
+DB_USER=soundweaver
+DB_PASSWORD=soundweaver
+DB_HOST=postgres
+DB_PORT=5432
+DB_NAME=soundweaver
+```

@@ -1,4 +1,3 @@
-import asyncio
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
@@ -10,6 +9,7 @@ from celery.exceptions import Retry
 
 from app.alignment import SpeakerSegment, WordTimestamp, build_utterances
 from app.asr.gigaam_service import GigaAMEmotionService, GigaAMService
+from app.async_utils import run_sync
 from app.audio.processing import normalize_audio
 from app.db.repositories import (
     claim_job_processing,
@@ -118,7 +118,12 @@ async def _mark_failed(job_id: str, error_code: str, error_message: str) -> None
         await mark_job_failed(session, job_id, error_code, error_message)
 
 
-async def _record_task_success(job_id: str, task_type: str, payload: dict) -> None:
+async def _record_task_success(
+    job_id: str,
+    task_type: str,
+    payload: dict,
+    exec_duration: float | None = None,
+) -> None:
     async with SessionLocal() as session:
         await upsert_task_result(
             session,
@@ -126,10 +131,17 @@ async def _record_task_success(job_id: str, task_type: str, payload: dict) -> No
             task_type=task_type,
             status="completed",
             payload=payload,
+            exec_duration=exec_duration,
         )
 
 
-async def _record_task_failure(job_id: str, task_type: str, error_code: str, error_message: str) -> None:
+async def _record_task_failure(
+    job_id: str,
+    task_type: str,
+    error_code: str,
+    error_message: str,
+    exec_duration: float | None = None,
+) -> None:
     async with SessionLocal() as session:
         await upsert_task_result(
             session,
@@ -137,6 +149,7 @@ async def _record_task_failure(job_id: str, task_type: str, error_code: str, err
             task_type=task_type,
             status="failed",
             payload={},
+            exec_duration=exec_duration,
             error_code=error_code,
             error_message=error_message,
         )
@@ -213,42 +226,44 @@ async def _prepare_transcription_job(job_id: str) -> None:
 @celery_app.task(name="prepare_transcription_job")
 def prepare_transcription_job(job_id: str) -> None:
     try:
-        asyncio.run(_prepare_transcription_job(job_id))
+        run_sync(_prepare_transcription_job(job_id))
     except AppError as exc:
-        asyncio.run(_mark_failed(job_id, exc.code.value, exc.message))
+        run_sync(_mark_failed(job_id, exc.code.value, exc.message))
     except Exception as exc:
-        asyncio.run(_mark_failed(job_id, ErrorCode.INTERNAL_ERROR.value, str(exc)))
+        run_sync(_mark_failed(job_id, ErrorCode.INTERNAL_ERROR.value, str(exc)))
 
 
 @celery_app.task(name="run_asr")
 def run_asr(job_id: str, normalized_object_key: str, word_timestamps: bool, duration_sec: float) -> dict:
     task_type = "asr"
-    started_at = perf_counter()
+    exec_duration = None
     try:
         assert_cuda_available()
         settings = get_settings()
         storage = AsyncS3Storage(settings)
         with TemporaryDirectory() as tmp:
             audio_path = Path(tmp) / "normalized.wav"
-            asyncio.run(storage.download_to_file(normalized_object_key, audio_path))
+            run_sync(storage.download_to_file(normalized_object_key, audio_path))
+            started_at = perf_counter()
             text, words = GigaAMService(settings.gigaam_model).transcribe(
                 audio_path,
                 word_timestamps=word_timestamps,
                 duration_sec=duration_sec,
             )
+            exec_duration = round(perf_counter() - started_at, 3)
         payload = {
             "text": text,
             "words": [_word_to_payload(word) for word in words],
             "duration_sec": duration_sec,
-            "asr_duration_sec": round(perf_counter() - started_at, 3),
+            "asr_duration_sec": exec_duration,
         }
-        asyncio.run(_record_task_success(job_id, task_type, payload))
+        run_sync(_record_task_success(job_id, task_type, payload, exec_duration))
         return {"task_type": task_type, "status": "completed"}
     except AppError as exc:
-        asyncio.run(_record_task_failure(job_id, task_type, exc.code.value, exc.message))
+        run_sync(_record_task_failure(job_id, task_type, exc.code.value, exc.message, exec_duration))
         raise
     except Exception as exc:
-        asyncio.run(_record_task_failure(job_id, task_type, ErrorCode.ASR_FAILED.value, str(exc)))
+        run_sync(_record_task_failure(job_id, task_type, ErrorCode.ASR_FAILED.value, str(exc), exec_duration))
         raise
 
 
@@ -261,15 +276,16 @@ def run_diarization(
     max_speakers: int | None,
 ) -> dict:
     task_type = "diarization"
-    started_at = perf_counter()
+    exec_duration = None
     try:
         assert_cuda_available()
         settings = get_settings()
         storage = AsyncS3Storage(settings)
         with TemporaryDirectory() as tmp:
             audio_path = Path(tmp) / "normalized.wav"
-            asyncio.run(storage.download_to_file(normalized_object_key, audio_path))
+            run_sync(storage.download_to_file(normalized_object_key, audio_path))
             waveform, sample_rate = torchaudio.load(str(audio_path))
+            started_at = perf_counter()
             segments = PyannoteDiarizationService(
                 settings.pyannote_model,
                 settings.hf_token,
@@ -281,43 +297,46 @@ def run_diarization(
                 min_speakers=min_speakers,
                 max_speakers=max_speakers,
             )
+            exec_duration = round(perf_counter() - started_at, 3)
         payload = {
             "segments": [_segment_to_payload(segment) for segment in segments],
-            "diarization_duration_sec": round(perf_counter() - started_at, 3),
+            "diarization_duration_sec": exec_duration,
         }
-        asyncio.run(_record_task_success(job_id, task_type, payload))
+        run_sync(_record_task_success(job_id, task_type, payload, exec_duration))
         return {"task_type": task_type, "status": "completed"}
     except AppError as exc:
-        asyncio.run(_record_task_failure(job_id, task_type, exc.code.value, exc.message))
+        run_sync(_record_task_failure(job_id, task_type, exc.code.value, exc.message, exec_duration))
         raise
     except Exception as exc:
-        asyncio.run(_record_task_failure(job_id, task_type, ErrorCode.DIARIZATION_FAILED.value, str(exc)))
+        run_sync(_record_task_failure(job_id, task_type, ErrorCode.DIARIZATION_FAILED.value, str(exc), exec_duration))
         raise
 
 
 @celery_app.task(name="run_emotions")
 def run_emotions(job_id: str, normalized_object_key: str) -> dict:
     task_type = "emotions"
-    started_at = perf_counter()
+    exec_duration = None
     try:
         assert_cuda_available()
         settings = get_settings()
         storage = AsyncS3Storage(settings)
         with TemporaryDirectory() as tmp:
             audio_path = Path(tmp) / "normalized.wav"
-            asyncio.run(storage.download_to_file(normalized_object_key, audio_path))
+            run_sync(storage.download_to_file(normalized_object_key, audio_path))
+            started_at = perf_counter()
             emotions = GigaAMEmotionService().get_probs(audio_path)
+            exec_duration = round(perf_counter() - started_at, 3)
         payload = {
             "emotions": emotions,
-            "emotions_duration_sec": round(perf_counter() - started_at, 3),
+            "emotions_duration_sec": exec_duration,
         }
-        asyncio.run(_record_task_success(job_id, task_type, payload))
+        run_sync(_record_task_success(job_id, task_type, payload, exec_duration))
         return {"task_type": task_type, "status": "completed"}
     except AppError as exc:
-        asyncio.run(_record_task_failure(job_id, task_type, exc.code.value, exc.message))
+        run_sync(_record_task_failure(job_id, task_type, exc.code.value, exc.message, exec_duration))
         raise
     except Exception as exc:
-        asyncio.run(_record_task_failure(job_id, task_type, ErrorCode.INTERNAL_ERROR.value, str(exc)))
+        run_sync(_record_task_failure(job_id, task_type, ErrorCode.INTERNAL_ERROR.value, str(exc), exec_duration))
         raise
 
 
@@ -358,9 +377,15 @@ async def _aggregate_transcription_job(job_id: str) -> bool:
         utterances = build_utterances(words, segments) if segments else []
         diagnostics = {
             "device": get_settings().device,
-            "asr_duration_sec": asr_payload.get("asr_duration_sec", 0.0),
-            "diarization_duration_sec": diarization_duration_sec,
-            "emotions_duration_sec": emotion_payload.get("emotions_duration_sec", 0.0),
+            "asr_duration_sec": results["asr"].exec_duration or asr_payload.get("asr_duration_sec", 0.0),
+            "diarization_duration_sec": (
+                results["diarization"].exec_duration or diarization_duration_sec
+                if job.diarization
+                else diarization_duration_sec
+            ),
+            "emotions_duration_sec": (
+                results["emotions"].exec_duration or emotion_payload.get("emotions_duration_sec", 0.0)
+            ),
             "emotions": emotion_payload.get("emotions", {}),
         }
         await mark_job_completed(
@@ -377,15 +402,15 @@ async def _aggregate_transcription_job(job_id: str) -> bool:
 @celery_app.task(bind=True, name="aggregate_transcription_job", max_retries=12, default_retry_delay=5)
 def aggregate_transcription_job(self, _child_results, job_id: str) -> None:
     try:
-        complete = asyncio.run(_aggregate_transcription_job(job_id))
+        complete = run_sync(_aggregate_transcription_job(job_id))
         if not complete:
             raise self.retry(countdown=5)
     except Retry:
         raise
     except AppError as exc:
-        asyncio.run(_mark_failed(job_id, exc.code.value, exc.message))
+        run_sync(_mark_failed(job_id, exc.code.value, exc.message))
     except Exception as exc:
-        asyncio.run(_mark_failed(job_id, ErrorCode.INTERNAL_ERROR.value, str(exc)))
+        run_sync(_mark_failed(job_id, ErrorCode.INTERNAL_ERROR.value, str(exc)))
 
 
 @celery_app.task(name="transcribe_audio")

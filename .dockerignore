@@ -1,10 +1,9 @@
 .git
+.pytest_cache
+.ruff_cache
 .venv
 __pycache__
-.pytest_cache
 *.pyc
-*.wav
-*.ogg
-*.mp3
-*.flac
-*.m4a
+docs
+tests
+*.egg-info

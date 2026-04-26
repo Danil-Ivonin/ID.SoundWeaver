@@ -1,6 +1,8 @@
+import gc
 from pathlib import Path
 
 import gigaam
+import torch
 
 from app.alignment import WordTimestamp
 
@@ -31,6 +33,8 @@ class GigaAMService:
             WordTimestamp(text=word.text, start=float(word.start), end=float(word.end))
             for word in result.words
         ]
+        gc.collect()
+        torch.cuda.empty_cache()
         return result.text, words
 
 
@@ -39,4 +43,7 @@ class GigaAMEmotionService:
         self.model = gigaam.load_model("emo")
 
     def get_probs(self, audio_path: Path) -> dict:
-        return self.model.get_probs(str(audio_path))
+        res = self.model.get_probs(str(audio_path))
+        gc.collect()
+        torch.cuda.empty_cache()
+        return res

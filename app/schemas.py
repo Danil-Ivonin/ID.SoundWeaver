@@ -17,7 +17,6 @@ SUPPORTED_CONTENT_TYPES = {
 class CreateUploadRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     content_type: str
-    size_bytes: int = Field(gt=0)
 
     @model_validator(mode="after")
     def validate_content_type(self) -> "CreateUploadRequest":

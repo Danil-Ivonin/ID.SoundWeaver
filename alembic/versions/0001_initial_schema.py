@@ -20,7 +20,7 @@ def upgrade() -> None:
         sa.Column("object_key", sa.String(length=512), nullable=False, unique=True),
         sa.Column("filename", sa.String(length=255), nullable=False),
         sa.Column("content_type", sa.String(length=128), nullable=False),
-        sa.Column("size_bytes", sa.Integer(), nullable=False),
+        sa.Column("size_bytes", sa.Integer(), nullable=True),
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),

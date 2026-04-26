@@ -1,8 +1,10 @@
 import re
-from datetime import timedelta
 from inspect import isawaitable
 from pathlib import Path, PurePath
 from typing import Any
+
+from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from app.settings import Settings, get_settings
 
@@ -40,20 +42,26 @@ class AsyncS3Storage:
     def build_normalized_artifact_key(self, job_id: str) -> str:
         return build_normalized_artifact_key(job_id)
 
-    def client(self):
+    def _resolve_endpoint_url(self, endpoint: str) -> str:
         scheme = "https" if self.settings.minio_secure else "http"
-        endpoint_url = self.settings.minio_endpoint
+        endpoint_url = endpoint
         if not endpoint_url.startswith(("http://", "https://")):
             endpoint_url = f"{scheme}://{endpoint_url}"
+        return endpoint_url
+
+    def client(self, *, public: bool = False):
+        endpoint = self.settings.minio_public_endpoint if public else self.settings.minio_endpoint
+        endpoint_url = self._resolve_endpoint_url(endpoint)
         return self.session.client(
             "s3",
             endpoint_url=endpoint_url,
             aws_access_key_id=self.settings.minio_access_key,
             aws_secret_access_key=self.settings.minio_secret_key,
+            config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
         )
 
     async def create_presigned_put_url(self, object_key: str) -> str:
-        async with self.client() as client:
+        async with self.client(public=True) as client:
             result = client.generate_presigned_url(
                 ClientMethod="put_object",
                 Params={"Bucket": self.settings.minio_bucket, "Key": object_key},
@@ -62,6 +70,17 @@ class AsyncS3Storage:
             if isawaitable(result):
                 return await result
             return result
+
+    async def ensure_bucket(self) -> None:
+        async with self.client() as client:
+            try:
+                await client.head_bucket(Bucket=self.settings.minio_bucket)
+            except ClientError as exc:
+                error_code = exc.response.get("Error", {}).get("Code")
+                status_code = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                if error_code not in {"404", "NoSuchBucket", "NotFound"} and status_code != 404:
+                    raise
+                await client.create_bucket(Bucket=self.settings.minio_bucket)
 
     async def download_to_file(self, object_key: str, path: Path) -> None:
         import aiofiles
@@ -93,11 +112,3 @@ class AsyncS3Storage:
                     return False
                 raise
         return True
-
-
-def create_presigned_put_url(client, bucket: str, object_key: str, ttl_sec: int) -> str:
-    return client.presigned_put_object(
-        bucket_name=bucket,
-        object_name=object_key,
-        expires=timedelta(seconds=ttl_sec),
-    )

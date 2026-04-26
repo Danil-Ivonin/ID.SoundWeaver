@@ -40,7 +40,7 @@ async def create_upload(
     object_key: str,
     filename: str,
     content_type: str,
-    size_bytes: int,
+    size_bytes: int | None,
     expires_at: datetime,
 ) -> Upload:
     upload = Upload(
@@ -214,6 +214,7 @@ async def upsert_task_result(
     task_type: str,
     status: str,
     payload: dict,
+    exec_duration: float | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
 ) -> TranscriptionTaskResult:
@@ -223,6 +224,7 @@ async def upsert_task_result(
         task_type=task_type,
         status=status,
         payload=payload,
+        exec_duration=exec_duration,
         error_code=error_code,
         error_message=error_message,
         updated_at=now,

@@ -9,7 +9,12 @@ from app.settings import get_settings
 def clear_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     get_settings.cache_clear()
     keys = [
-        "DATABASE_URL",
+        "DB_DRIVER",
+        "DB_USER",
+        "DB_PASSWORD",
+        "DB_HOST",
+        "DB_PORT",
+        "DB_NAME",
         "REDIS_URL",
         "MINIO_ENDPOINT",
         "MINIO_PUBLIC_ENDPOINT",
@@ -21,7 +26,6 @@ def clear_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
         "PYANNOTE_MODEL",
         "GIGAAM_MODEL",
         "DEVICE",
-        "MAX_UPLOAD_SIZE_BYTES",
         "MAX_AUDIO_DURATION_SEC",
         "PRESIGNED_UPLOAD_TTL_SEC",
     ]

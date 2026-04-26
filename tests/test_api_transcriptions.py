@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
-from fastapi.testclient import TestClient
+import pytest
+from httpx import ASGITransport, AsyncClient
 
 from app.main import create_app
 
@@ -65,30 +66,31 @@ class FakeStorage:
         return True
 
 
-def test_create_transcription_enqueues_job():
-    app = create_app()
-    app.state.job_repo = FakeJobRepo()
-    app.state.queue = FakeQueue()
-    app.state.storage = FakeStorage()
-    app.state.new_id = lambda: "job_1"
-    client = TestClient(app)
-
-    response = client.post(
-        "/v1/transcriptions",
-        json={"upload_id": "upload_1", "diarization": True, "min_speakers": 1, "max_speakers": 5},
+@pytest.mark.anyio
+async def test_create_transcription_enqueues_job():
+    queue = FakeQueue()
+    app = create_app(
+        job_repo=FakeJobRepo(),
+        queue=queue,
+        storage=FakeStorage(),
+        new_id=lambda: "job_1",
     )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v1/transcriptions",
+            json={"upload_id": "upload_1", "diarization": True, "min_speakers": 1, "max_speakers": 5},
+        )
 
     assert response.status_code == 200
     assert response.json() == {"job_id": "job_1", "status": "queued"}
-    assert app.state.queue.enqueued == ["job_1"]
+    assert queue.enqueued == ["job_1"]
 
 
-def test_get_completed_transcription_returns_empty_utterances_without_diarization():
-    app = create_app()
-    app.state.job_repo = FakeJobRepo()
-    client = TestClient(app)
-
-    response = client.get("/v1/transcriptions/completed")
+@pytest.mark.anyio
+async def test_get_completed_transcription_returns_empty_utterances_without_diarization():
+    app = create_app(job_repo=FakeJobRepo())
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/v1/transcriptions/completed")
 
     assert response.status_code == 200
     assert response.json()["status"] == "completed"
@@ -96,21 +98,23 @@ def test_get_completed_transcription_returns_empty_utterances_without_diarizatio
     assert response.json()["diagnostics"] == {"emotions": {"neutral": 0.7}}
 
 
-def test_create_transcription_does_not_enqueue_existing_duplicate_job():
-    app = create_app()
+@pytest.mark.anyio
+async def test_create_transcription_does_not_enqueue_existing_duplicate_job():
     repo = FakeJobRepo()
     repo.created = False
-    app.state.job_repo = repo
-    app.state.queue = FakeQueue()
-    app.state.storage = FakeStorage()
-    app.state.new_id = lambda: "job_1"
-    client = TestClient(app)
-
-    response = client.post(
-        "/v1/transcriptions",
-        json={"upload_id": "upload_1", "diarization": True, "min_speakers": 1, "max_speakers": 5},
+    queue = FakeQueue()
+    app = create_app(
+        job_repo=repo,
+        queue=queue,
+        storage=FakeStorage(),
+        new_id=lambda: "job_1",
     )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            "/v1/transcriptions",
+            json={"upload_id": "upload_1", "diarization": True, "min_speakers": 1, "max_speakers": 5},
+        )
 
     assert response.status_code == 200
     assert response.json() == {"job_id": "job_1", "status": "queued"}
-    assert app.state.queue.enqueued == []
+    assert queue.enqueued == []

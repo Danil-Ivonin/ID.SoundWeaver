@@ -8,7 +8,6 @@ def test_create_upload_accepts_supported_audio_type():
     request = CreateUploadRequest(
         filename="meeting.wav",
         content_type="audio/wav",
-        size_bytes=1024,
     )
 
     assert request.filename == "meeting.wav"
@@ -16,7 +15,7 @@ def test_create_upload_accepts_supported_audio_type():
 
 def test_create_upload_rejects_unsupported_audio_type():
     with pytest.raises(ValidationError):
-        CreateUploadRequest(filename="notes.txt", content_type="text/plain", size_bytes=1024)
+        CreateUploadRequest(filename="notes.txt", content_type="text/plain")
 
 
 def test_transcription_rejects_conflicting_speaker_params():

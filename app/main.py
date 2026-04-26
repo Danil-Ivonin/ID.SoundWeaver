@@ -1,52 +1,53 @@
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.api import health, transcriptions, uploads
-from app.db.repositories import create_upload, get_job, get_or_create_job, get_upload
-from app.db.session import SessionLocal
-from app.settings import get_settings
-from app.storage.minio import AsyncS3Storage
+from app.async_utils import maybe_await
+from app.dependencies import (
+    Clock,
+    IdGenerator,
+    JobRepo,
+    Queue,
+    Storage,
+    UploadRepo,
+    build_app_dependencies,
+    storage_supports_ensure_bucket,
+)
+from app.settings import Settings
 
 
-class RuntimeUploadRepo:
-    async def create_upload(self, **kwargs):
-        async with SessionLocal() as session:
-            return await create_upload(session, **kwargs)
+def create_app(
+    *,
+    settings: Settings | None = None,
+    storage: Storage | None = None,
+    upload_repo: UploadRepo | None = None,
+    job_repo: JobRepo | None = None,
+    queue: Queue | None = None,
+    now: Clock | None = None,
+    new_id: IdGenerator | None = None,
+) -> FastAPI:
+    deps = build_app_dependencies(
+        settings=settings,
+        storage=storage,
+        upload_repo=upload_repo,
+        job_repo=job_repo,
+        queue=queue,
+        now=now,
+        new_id_generator=new_id,
+    )
 
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        ensure_bucket = storage_supports_ensure_bucket(deps.storage)
+        if ensure_bucket is not None:
+            await maybe_await(ensure_bucket())
+        yield
 
-class RuntimeJobRepo:
-    async def get_upload(self, upload_id: str):
-        async with SessionLocal() as session:
-            return await get_upload(session, upload_id)
-
-    async def get_or_create_job(self, **kwargs):
-        async with SessionLocal() as session:
-            return await get_or_create_job(session, **kwargs)
-
-    async def get_job(self, job_id: str):
-        async with SessionLocal() as session:
-            return await get_job(session, job_id)
-
-
-class RuntimeQueue:
-    def enqueue(self, job_id: str) -> None:
-        from app.tasks.transcription import prepare_transcription_job
-
-        prepare_transcription_job.delay(job_id)
-
-
-def create_app() -> FastAPI:
-    app = FastAPI(title="ID.SoundWeaver")
-    settings = get_settings()
-    app.state.storage = AsyncS3Storage(settings)
-    app.state.upload_repo = RuntimeUploadRepo()
-    app.state.job_repo = RuntimeJobRepo()
-    app.state.queue = RuntimeQueue()
-    app.state.now = lambda: datetime.now(timezone.utc)
+    app = FastAPI(title="ID.SoundWeaver", lifespan=lifespan)
     app.include_router(health.router)
-    app.include_router(uploads.router)
-    app.include_router(transcriptions.router)
+    app.include_router(uploads.build_uploads_router(deps))
+    app.include_router(transcriptions.build_transcriptions_router(deps))
     return app
 
 

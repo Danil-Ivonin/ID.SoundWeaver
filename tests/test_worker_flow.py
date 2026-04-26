@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from app.alignment import SpeakerSegment, WordTimestamp
+from app.tasks import transcription
 from app.tasks.transcription import TranscriptionProcessor
 
 
@@ -110,3 +111,48 @@ def test_processor_returns_speaker_utterances_with_diarization(tmp_path):
     assert result["diagnostics"]["asr_duration_sec"] == 2.4
     assert result["diagnostics"]["diarization_duration_sec"] == 1.8
     assert result["diagnostics"]["total_processing_sec"] == 5.5
+
+
+def test_run_asr_records_model_execution_duration(monkeypatch, tmp_path):
+    recorded = {}
+
+    class FakeStorage:
+        async def download_to_file(self, object_key, path):
+            Path(path).write_bytes(b"fake")
+
+    class FakeAsrService:
+        def __init__(self, _model_name):
+            pass
+
+        def transcribe(self, audio_path, *, word_timestamps, duration_sec):
+            return "hello world", [
+                WordTimestamp(text="hello", start=0.0, end=0.5),
+                WordTimestamp(text="world", start=0.5, end=1.0),
+            ]
+
+    class FakePerfCounter:
+        def __init__(self, values):
+            self.values = iter(values)
+
+        def __call__(self):
+            return next(self.values)
+
+    async def fake_record_task_success(job_id, task_type, payload, exec_duration=None):
+        recorded["job_id"] = job_id
+        recorded["task_type"] = task_type
+        recorded["payload"] = payload
+        recorded["exec_duration"] = exec_duration
+
+    monkeypatch.setattr(transcription, "assert_cuda_available", lambda: None)
+    monkeypatch.setattr(transcription, "AsyncS3Storage", lambda settings: FakeStorage())
+    monkeypatch.setattr(transcription, "GigaAMService", FakeAsrService)
+    monkeypatch.setattr(transcription, "_record_task_success", fake_record_task_success)
+    monkeypatch.setattr(transcription, "perf_counter", FakePerfCounter([10.0, 10.4]))
+
+    result = transcription.run_asr("job_1", "artifacts/job_1/normalized.wav", True, 1.0)
+
+    assert result == {"task_type": "asr", "status": "completed"}
+    assert recorded["job_id"] == "job_1"
+    assert recorded["task_type"] == "asr"
+    assert recorded["exec_duration"] == 0.4
+    assert recorded["payload"]["asr_duration_sec"] == 0.4

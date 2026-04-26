@@ -1,3 +1,5 @@
+import gc
+
 import torch
 from pyannote.audio import Pipeline
 
@@ -25,6 +27,8 @@ class PyannoteDiarizationService:
         }
         kwargs = {key: value for key, value in kwargs.items() if value is not None}
         output = self.pipeline({"waveform": waveform, "sample_rate": sample_rate}, **kwargs)
+        gc.collect()
+        torch.cuda.empty_cache()
         return [
             SpeakerSegment(speaker=speaker, start=float(turn.start), end=float(turn.end))
             for turn, speaker in output.speaker_diarization
