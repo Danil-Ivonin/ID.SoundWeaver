@@ -1,6 +1,7 @@
 from celery import Celery
 
 from app.settings import get_settings
+from app.tasks import preload_models as _preload_models  # noqa: F401
 
 
 def create_celery_app() -> Celery:

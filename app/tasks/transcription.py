@@ -4,11 +4,10 @@ from time import perf_counter
 
 import torch
 import torchaudio
-from celery import chord
 from celery.exceptions import Retry
 
 from app.alignment import SpeakerSegment, WordTimestamp, build_utterances
-from app.asr.gigaam_service import GigaAMEmotionService, GigaAMService
+from app.asr.gigaam_service import GigaAMEmotionService, GigaAMService, clear_cuda_state
 from app.async_utils import run_sync
 from app.audio.processing import normalize_audio
 from app.db.repositories import (
@@ -78,7 +77,7 @@ class TranscriptionProcessor:
             duration_sec=audio.duration_sec,
         )
         asr_duration_sec = self.clock() - asr_started_at
-        emotions = self.emotion_model.get_probs(audio.path)
+        emotions = self.emotion_model.get_probs(audio.path, duration_sec=audio.duration_sec)
 
         utterances = []
         if diarization:
@@ -180,6 +179,320 @@ def _segment_from_payload(payload: dict) -> SpeakerSegment:
     )
 
 
+def reset_model_caches() -> None:
+    GigaAMService.clear_cache()
+    GigaAMEmotionService.clear_cache()
+    PyannoteDiarizationService.clear_cache()
+
+
+def _handle_stage_failure(
+    job_id: str,
+    task_type: str,
+    error_code: str,
+    error_message: str,
+    exec_duration: float | None = None,
+) -> None:
+    run_sync(_record_task_failure(job_id, task_type, error_code, error_message, exec_duration))
+    if "out of memory" in error_message.lower():
+        reset_model_caches()
+    clear_cuda_state()
+
+
+async def _handle_stage_failure_async(
+    job_id: str,
+    task_type: str,
+    error_code: str,
+    error_message: str,
+    exec_duration: float | None = None,
+) -> None:
+    await _record_task_failure(job_id, task_type, error_code, error_message, exec_duration)
+    if "out of memory" in error_message.lower():
+        reset_model_caches()
+    clear_cuda_state()
+
+
+def run_transcription_pipeline(
+    job_id: str,
+    *,
+    audio,
+    diarization_enabled: bool,
+    num_speakers: int | None,
+    min_speakers: int | None,
+    max_speakers: int | None,
+    asr,
+    emotion_model,
+    diarization_service,
+) -> dict:
+    task_results: dict[str, dict] = {}
+
+    asr_duration = None
+    try:
+        started_at = perf_counter()
+        text, words = asr.transcribe(
+            audio.path,
+            word_timestamps=diarization_enabled,
+            duration_sec=audio.duration_sec,
+        )
+        asr_duration = round(perf_counter() - started_at, 3)
+        task_results["asr"] = {
+            "text": text,
+            "words": words,
+            "duration_sec": audio.duration_sec,
+            "asr_duration_sec": asr_duration,
+        }
+        run_sync(
+            _record_task_success(
+                job_id,
+                "asr",
+                {
+                    "text": text,
+                    "words": [_word_to_payload(word) for word in words],
+                    "duration_sec": audio.duration_sec,
+                    "asr_duration_sec": asr_duration,
+                },
+                asr_duration,
+            )
+        )
+    except AppError as exc:
+        _handle_stage_failure(job_id, "asr", exc.code.value, exc.message, asr_duration)
+        raise
+    except Exception as exc:
+        _handle_stage_failure(job_id, "asr", ErrorCode.ASR_FAILED.value, str(exc), asr_duration)
+        raise
+    finally:
+        clear_cuda_state()
+
+    emotions_duration = None
+    try:
+        started_at = perf_counter()
+        emotions = emotion_model.get_probs(audio.path, duration_sec=audio.duration_sec)
+        emotions_duration = round(perf_counter() - started_at, 3)
+        task_results["emotions"] = {
+            "emotions": emotions,
+            "emotions_duration_sec": emotions_duration,
+        }
+        run_sync(
+            _record_task_success(
+                job_id,
+                "emotions",
+                {
+                    "emotions": emotions,
+                    "emotions_duration_sec": emotions_duration,
+                },
+                emotions_duration,
+            )
+        )
+    except AppError as exc:
+        _handle_stage_failure(job_id, "emotions", exc.code.value, exc.message, emotions_duration)
+        raise
+    except Exception as exc:
+        _handle_stage_failure(job_id, "emotions", ErrorCode.INTERNAL_ERROR.value, str(exc), emotions_duration)
+        raise
+    finally:
+        clear_cuda_state()
+
+    segments: list[SpeakerSegment] = []
+    diarization_duration = 0.0
+    if diarization_enabled:
+        try:
+            started_at = perf_counter()
+            segments = diarization_service.diarize(
+                waveform=audio.waveform,
+                sample_rate=audio.sample_rate,
+                num_speakers=num_speakers,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+            )
+            diarization_duration = round(perf_counter() - started_at, 3)
+            task_results["diarization"] = {
+                "segments": segments,
+                "diarization_duration_sec": diarization_duration,
+            }
+            run_sync(
+                _record_task_success(
+                    job_id,
+                    "diarization",
+                    {
+                        "segments": [_segment_to_payload(segment) for segment in segments],
+                        "diarization_duration_sec": diarization_duration,
+                    },
+                    diarization_duration,
+                )
+            )
+        except AppError as exc:
+            _handle_stage_failure(job_id, "diarization", exc.code.value, exc.message, diarization_duration or None)
+            raise
+        except Exception as exc:
+            _handle_stage_failure(
+                job_id,
+                "diarization",
+                ErrorCode.DIARIZATION_FAILED.value,
+                str(exc),
+                diarization_duration or None,
+            )
+            raise
+        finally:
+            clear_cuda_state()
+
+    utterances = build_utterances(task_results["asr"]["words"], segments) if segments else []
+    return {
+        "duration_sec": task_results["asr"]["duration_sec"],
+        "text": task_results["asr"]["text"],
+        "utterances": utterances,
+        "diagnostics": {
+            "device": get_settings().device,
+            "asr_duration_sec": task_results["asr"]["asr_duration_sec"],
+            "diarization_duration_sec": diarization_duration,
+            "emotions_duration_sec": task_results["emotions"]["emotions_duration_sec"],
+            "emotions": task_results["emotions"]["emotions"],
+        },
+    }
+
+
+async def run_transcription_pipeline_async(
+    job_id: str,
+    *,
+    audio,
+    diarization_enabled: bool,
+    num_speakers: int | None,
+    min_speakers: int | None,
+    max_speakers: int | None,
+    asr,
+    emotion_model,
+    diarization_service,
+) -> dict:
+    task_results: dict[str, dict] = {}
+
+    asr_duration = None
+    try:
+        started_at = perf_counter()
+        text, words = asr.transcribe(
+            audio.path,
+            word_timestamps=diarization_enabled,
+            duration_sec=audio.duration_sec,
+        )
+        asr_duration = round(perf_counter() - started_at, 3)
+        task_results["asr"] = {
+            "text": text,
+            "words": words,
+            "duration_sec": audio.duration_sec,
+            "asr_duration_sec": asr_duration,
+        }
+        await _record_task_success(
+            job_id,
+            "asr",
+            {
+                "text": text,
+                "words": [_word_to_payload(word) for word in words],
+                "duration_sec": audio.duration_sec,
+                "asr_duration_sec": asr_duration,
+            },
+            asr_duration,
+        )
+    except AppError as exc:
+        await _handle_stage_failure_async(job_id, "asr", exc.code.value, exc.message, asr_duration)
+        raise
+    except Exception as exc:
+        await _handle_stage_failure_async(job_id, "asr", ErrorCode.ASR_FAILED.value, str(exc), asr_duration)
+        raise
+    finally:
+        clear_cuda_state()
+
+    emotions_duration = None
+    try:
+        started_at = perf_counter()
+        emotions = emotion_model.get_probs(audio.path, duration_sec=audio.duration_sec)
+        emotions_duration = round(perf_counter() - started_at, 3)
+        task_results["emotions"] = {
+            "emotions": emotions,
+            "emotions_duration_sec": emotions_duration,
+        }
+        await _record_task_success(
+            job_id,
+            "emotions",
+            {
+                "emotions": emotions,
+                "emotions_duration_sec": emotions_duration,
+            },
+            emotions_duration,
+        )
+    except AppError as exc:
+        await _handle_stage_failure_async(job_id, "emotions", exc.code.value, exc.message, emotions_duration)
+        raise
+    except Exception as exc:
+        await _handle_stage_failure_async(
+            job_id,
+            "emotions",
+            ErrorCode.INTERNAL_ERROR.value,
+            str(exc),
+            emotions_duration,
+        )
+        raise
+    finally:
+        clear_cuda_state()
+
+    segments: list[SpeakerSegment] = []
+    diarization_duration = 0.0
+    if diarization_enabled:
+        try:
+            started_at = perf_counter()
+            segments = diarization_service.diarize(
+                waveform=audio.waveform,
+                sample_rate=audio.sample_rate,
+                num_speakers=num_speakers,
+                min_speakers=min_speakers,
+                max_speakers=max_speakers,
+            )
+            diarization_duration = round(perf_counter() - started_at, 3)
+            task_results["diarization"] = {
+                "segments": segments,
+                "diarization_duration_sec": diarization_duration,
+            }
+            await _record_task_success(
+                job_id,
+                "diarization",
+                {
+                    "segments": [_segment_to_payload(segment) for segment in segments],
+                    "diarization_duration_sec": diarization_duration,
+                },
+                diarization_duration,
+            )
+        except AppError as exc:
+            await _handle_stage_failure_async(
+                job_id,
+                "diarization",
+                exc.code.value,
+                exc.message,
+                diarization_duration or None,
+            )
+            raise
+        except Exception as exc:
+            await _handle_stage_failure_async(
+                job_id,
+                "diarization",
+                ErrorCode.DIARIZATION_FAILED.value,
+                str(exc),
+                diarization_duration or None,
+            )
+            raise
+        finally:
+            clear_cuda_state()
+
+    utterances = build_utterances(task_results["asr"]["words"], segments) if segments else []
+    return {
+        "duration_sec": task_results["asr"]["duration_sec"],
+        "text": task_results["asr"]["text"],
+        "utterances": utterances,
+        "diagnostics": {
+            "device": get_settings().device,
+            "asr_duration_sec": task_results["asr"]["asr_duration_sec"],
+            "diarization_duration_sec": diarization_duration,
+            "emotions_duration_sec": task_results["emotions"]["emotions_duration_sec"],
+            "emotions": task_results["emotions"]["emotions"],
+        },
+    }
+
+
 async def _prepare_transcription_job(job_id: str) -> None:
     settings = get_settings()
     async with SessionLocal() as session:
@@ -197,30 +510,40 @@ async def _prepare_transcription_job(job_id: str) -> None:
         max_speakers = job.max_speakers
 
     storage = AsyncS3Storage(settings)
-    artifact_key = storage.build_normalized_artifact_key(job_id)
     with TemporaryDirectory() as tmp:
         work_dir = Path(tmp)
         input_path = work_dir / "input_audio"
         normalized_path = work_dir / "normalized.wav"
         await storage.download_to_file(object_key, input_path)
         audio = normalize_audio(input_path, normalized_path, settings.max_audio_duration_sec)
-        await storage.upload_file(normalized_path, artifact_key)
-
-    header = [
-        run_asr.s(job_id, artifact_key, diarization, audio.duration_sec),
-        run_emotions.s(job_id, artifact_key),
-    ]
-    if diarization:
-        header.append(
-            run_diarization.s(
-                job_id,
-                artifact_key,
-                num_speakers,
-                min_speakers,
-                max_speakers,
-            )
+        result = await run_transcription_pipeline_async(
+            job_id,
+            audio=audio,
+            diarization_enabled=diarization,
+            num_speakers=num_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            asr=GigaAMService.get_cached(settings.gigaam_model),
+            emotion_model=GigaAMEmotionService.get_cached(),
+            diarization_service=(
+                PyannoteDiarizationService.get_cached(
+                    settings.pyannote_model,
+                    settings.hf_token,
+                    settings.device,
+                )
+                if diarization
+                else None
+            ),
         )
-    chord(header)(aggregate_transcription_job.s(job_id))
+    async with SessionLocal() as session:
+        await mark_job_completed(
+            session,
+            job_id=job_id,
+            duration_sec=result["duration_sec"],
+            text=result["text"],
+            utterances=result["utterances"],
+            diagnostics=result["diagnostics"],
+        )
 
 
 @celery_app.task(name="prepare_transcription_job")
@@ -245,7 +568,7 @@ def run_asr(job_id: str, normalized_object_key: str, word_timestamps: bool, dura
             audio_path = Path(tmp) / "normalized.wav"
             run_sync(storage.download_to_file(normalized_object_key, audio_path))
             started_at = perf_counter()
-            text, words = GigaAMService(settings.gigaam_model).transcribe(
+            text, words = GigaAMService.get_cached(settings.gigaam_model).transcribe(
                 audio_path,
                 word_timestamps=word_timestamps,
                 duration_sec=duration_sec,
@@ -260,10 +583,10 @@ def run_asr(job_id: str, normalized_object_key: str, word_timestamps: bool, dura
         run_sync(_record_task_success(job_id, task_type, payload, exec_duration))
         return {"task_type": task_type, "status": "completed"}
     except AppError as exc:
-        run_sync(_record_task_failure(job_id, task_type, exc.code.value, exc.message, exec_duration))
+        _handle_stage_failure(job_id, task_type, exc.code.value, exc.message, exec_duration)
         raise
     except Exception as exc:
-        run_sync(_record_task_failure(job_id, task_type, ErrorCode.ASR_FAILED.value, str(exc), exec_duration))
+        _handle_stage_failure(job_id, task_type, ErrorCode.ASR_FAILED.value, str(exc), exec_duration)
         raise
 
 
@@ -286,7 +609,7 @@ def run_diarization(
             run_sync(storage.download_to_file(normalized_object_key, audio_path))
             waveform, sample_rate = torchaudio.load(str(audio_path))
             started_at = perf_counter()
-            segments = PyannoteDiarizationService(
+            segments = PyannoteDiarizationService.get_cached(
                 settings.pyannote_model,
                 settings.hf_token,
                 settings.device,
@@ -305,10 +628,10 @@ def run_diarization(
         run_sync(_record_task_success(job_id, task_type, payload, exec_duration))
         return {"task_type": task_type, "status": "completed"}
     except AppError as exc:
-        run_sync(_record_task_failure(job_id, task_type, exc.code.value, exc.message, exec_duration))
+        _handle_stage_failure(job_id, task_type, exc.code.value, exc.message, exec_duration)
         raise
     except Exception as exc:
-        run_sync(_record_task_failure(job_id, task_type, ErrorCode.DIARIZATION_FAILED.value, str(exc), exec_duration))
+        _handle_stage_failure(job_id, task_type, ErrorCode.DIARIZATION_FAILED.value, str(exc), exec_duration)
         raise
 
 
@@ -324,7 +647,7 @@ def run_emotions(job_id: str, normalized_object_key: str) -> dict:
             audio_path = Path(tmp) / "normalized.wav"
             run_sync(storage.download_to_file(normalized_object_key, audio_path))
             started_at = perf_counter()
-            emotions = GigaAMEmotionService().get_probs(audio_path)
+            emotions = GigaAMEmotionService.get_cached().get_probs(audio_path, duration_sec=duration_sec)
             exec_duration = round(perf_counter() - started_at, 3)
         payload = {
             "emotions": emotions,
@@ -333,10 +656,10 @@ def run_emotions(job_id: str, normalized_object_key: str) -> dict:
         run_sync(_record_task_success(job_id, task_type, payload, exec_duration))
         return {"task_type": task_type, "status": "completed"}
     except AppError as exc:
-        run_sync(_record_task_failure(job_id, task_type, exc.code.value, exc.message, exec_duration))
+        _handle_stage_failure(job_id, task_type, exc.code.value, exc.message, exec_duration)
         raise
     except Exception as exc:
-        run_sync(_record_task_failure(job_id, task_type, ErrorCode.INTERNAL_ERROR.value, str(exc), exec_duration))
+        _handle_stage_failure(job_id, task_type, ErrorCode.INTERNAL_ERROR.value, str(exc), exec_duration)
         raise
 
 

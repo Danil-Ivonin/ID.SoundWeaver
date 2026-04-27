@@ -22,8 +22,7 @@ services:
       context: .
       target: worker
     command: >-
-      /bin/bash -lc "python -m app.tasks.preload_models &&
-      celery -A app.tasks.celery_app.celery_app worker --loglevel=INFO --concurrency=3"
+      celery -A app.tasks.celery_app.celery_app worker --loglevel=INFO --concurrency=1
     env_file:
       - path: .env
         required: false

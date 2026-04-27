@@ -32,7 +32,8 @@ def test_compose_uses_separate_api_and_worker_targets() -> None:
     assert "uvicorn app.main:app" in api_command
 
     worker_command = compose["services"]["worker"]["command"]
-    assert "preload_models" in worker_command
+    assert "celery -A app.tasks.celery_app.celery_app worker" in worker_command
+    assert "--concurrency=1" in worker_command
 
 
 def test_compose_postgres_uses_official_env_and_worker_is_gpu_profile() -> None:
