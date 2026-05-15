@@ -12,7 +12,7 @@ Planned production stack:
 - Redis and Celery for background processing.
 - NVIDIA GPU inference for GigaAM and pyannote.
 
-The service targets recordings up to 1 hour long and returns either plain transcription text or speaker-labeled utterances. Long ASR inputs use GigaAM `transcribe_longform`.
+The service targets recordings up to 1 hour long and returns either plain transcription text or speaker-labeled utterances. ASR work is split into overlapping chunks before GPU inference. By default, chunks are 30 seconds long with a 25 second stride, so neighboring chunks overlap by 5 seconds and words near chunk borders can be deduplicated during aggregation.
 
 This service requires a minimum of `880 MB` of video memory for stable operation.
 
@@ -41,4 +41,6 @@ DB_PASSWORD=soundweaver
 DB_HOST=postgres
 DB_PORT=5432
 DB_NAME=soundweaver
+TRANSCRIPTION_CHUNK_DURATION_SEC=30
+TRANSCRIPTION_CHUNK_STRIDE_SEC=25
 ```

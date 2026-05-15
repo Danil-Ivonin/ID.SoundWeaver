@@ -14,6 +14,47 @@ class NormalizedAudio:
     path: Path
 
 
+def build_chunk_windows(
+    *,
+    duration_sec: float,
+    chunk_duration_sec: int,
+    chunk_stride_sec: int,
+) -> list[dict]:
+    if chunk_duration_sec <= 0:
+        raise ValueError("chunk_duration_sec must be positive")
+    if chunk_stride_sec <= 0:
+        raise ValueError("chunk_stride_sec must be positive")
+    if chunk_stride_sec > chunk_duration_sec:
+        raise ValueError("chunk_stride_sec cannot exceed chunk_duration_sec")
+    if duration_sec <= 0:
+        return []
+
+    windows = []
+    start_sec = 0.0
+    index = 0
+    while start_sec < duration_sec:
+        end_sec = min(start_sec + chunk_duration_sec, duration_sec)
+        windows.append({"index": index, "start_sec": round(start_sec, 6), "end_sec": round(end_sec, 6)})
+        if end_sec >= duration_sec:
+            break
+        start_sec += chunk_stride_sec
+        index += 1
+    return windows
+
+
+def save_audio_chunk(audio: NormalizedAudio, output_path: Path, *, start_sec: float, end_sec: float) -> NormalizedAudio:
+    start_frame = max(0, int(round(start_sec * audio.sample_rate)))
+    end_frame = min(audio.waveform.shape[1], int(round(end_sec * audio.sample_rate)))
+    waveform = audio.waveform[:, start_frame:end_frame]
+    torchaudio.save(str(output_path), waveform, audio.sample_rate)
+    return NormalizedAudio(
+        waveform=waveform,
+        sample_rate=audio.sample_rate,
+        duration_sec=waveform.shape[1] / audio.sample_rate,
+        path=output_path,
+    )
+
+
 def normalize_audio(input_path: Path, output_path: Path, max_duration_sec: int) -> NormalizedAudio:
     try:
         waveform, sample_rate = torchaudio.load(str(input_path))

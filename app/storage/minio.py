@@ -25,6 +25,10 @@ def build_normalized_artifact_key(job_id: str) -> str:
     return f"artifacts/{job_id}/normalized.wav"
 
 
+def build_audio_chunk_artifact_key(job_id: str, chunk_index: int) -> str:
+    return f"artifacts/{job_id}/chunks/{chunk_index:06d}.wav"
+
+
 def create_aioboto3_session():
     import aioboto3
 
@@ -41,6 +45,9 @@ class AsyncS3Storage:
 
     def build_normalized_artifact_key(self, job_id: str) -> str:
         return build_normalized_artifact_key(job_id)
+
+    def build_audio_chunk_artifact_key(self, job_id: str, chunk_index: int) -> str:
+        return build_audio_chunk_artifact_key(job_id, chunk_index)
 
     def _resolve_endpoint_url(self, endpoint: str) -> str:
         scheme = "https" if self.settings.minio_secure else "http"

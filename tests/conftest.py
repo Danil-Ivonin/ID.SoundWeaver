@@ -27,6 +27,8 @@ def clear_env(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
         "GIGAAM_MODEL",
         "DEVICE",
         "MAX_AUDIO_DURATION_SEC",
+        "TRANSCRIPTION_CHUNK_DURATION_SEC",
+        "TRANSCRIPTION_CHUNK_STRIDE_SEC",
         "PRESIGNED_UPLOAD_TTL_SEC",
     ]
     for key in keys:

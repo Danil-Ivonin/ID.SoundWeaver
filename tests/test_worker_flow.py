@@ -1,10 +1,15 @@
+import asyncio
 from pathlib import Path
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.alignment import SpeakerSegment, WordTimestamp
+from app.db.base import Base
+from app.db.models import utc_now
+from app.db.repositories import create_job, create_upload, get_job, upsert_task_result
 from app.tasks import transcription
-from app.tasks.transcription import TranscriptionProcessor
+from app.tasks.transcription import TranscriptionProcessor, build_transcription_child_signatures, merge_asr_chunk_payloads
 
 
 class FakeStorage:
@@ -167,6 +172,57 @@ def test_run_asr_records_model_execution_duration(monkeypatch, tmp_path):
     assert recorded["payload"]["asr_duration_sec"] == 0.4
 
 
+def test_run_asr_records_chunk_metadata_and_absolute_word_times(monkeypatch):
+    recorded = {}
+
+    class FakeStorage:
+        async def download_to_file(self, object_key, path):
+            Path(path).write_bytes(b"fake")
+
+    class FakeAsrService:
+        @classmethod
+        def get_cached(cls, model_name):
+            return cls()
+
+        def transcribe(self, audio_path, *, word_timestamps, duration_sec):
+            return "middle word", [
+                WordTimestamp(text="middle", start=1.0, end=1.5),
+                WordTimestamp(text="word", start=2.0, end=2.5),
+            ]
+
+    async def fake_record_task_success(job_id, task_type, payload, exec_duration=None):
+        recorded["job_id"] = job_id
+        recorded["task_type"] = task_type
+        recorded["payload"] = payload
+        recorded["exec_duration"] = exec_duration
+
+    monkeypatch.setattr(transcription, "assert_cuda_available", lambda: None)
+    monkeypatch.setattr(transcription, "AsyncS3Storage", lambda settings: FakeStorage())
+    monkeypatch.setattr(transcription, "GigaAMService", FakeAsrService)
+    monkeypatch.setattr(transcription, "_record_task_success", fake_record_task_success)
+    monkeypatch.setattr(transcription, "perf_counter", FakeClock([10.0, 10.4]))
+
+    result = transcription.run_asr(
+        "job_1",
+        "artifacts/job_1/chunks/000001.wav",
+        True,
+        30.0,
+        chunk_index=1,
+        chunk_start_sec=25.0,
+        chunk_end_sec=55.0,
+    )
+
+    assert result == {"task_type": "asr:000001", "status": "completed"}
+    assert recorded["task_type"] == "asr:000001"
+    assert recorded["payload"]["chunk_index"] == 1
+    assert recorded["payload"]["chunk_start_sec"] == 25.0
+    assert recorded["payload"]["chunk_end_sec"] == 55.0
+    assert recorded["payload"]["words"] == [
+        {"text": "middle", "start": 26.0, "end": 26.5},
+        {"text": "word", "start": 27.0, "end": 27.5},
+    ]
+
+
 def test_run_pipeline_records_stage_results_sequentially(monkeypatch, tmp_path):
     stage_calls = []
     recorded = []
@@ -308,3 +364,181 @@ def test_async_pipeline_records_results_without_nested_run_sync(monkeypatch, tmp
 
     assert [item[1] for item in recorded] == ["asr", "emotions", "diarization"]
     assert result["text"] == "hello world"
+
+
+def test_merge_asr_chunk_payloads_deduplicates_overlap_by_midpoint():
+    payloads = [
+        {
+            "chunk_index": 0,
+            "chunk_start_sec": 0.0,
+            "chunk_end_sec": 30.0,
+            "duration_sec": 30.0,
+            "asr_duration_sec": 0.4,
+            "words": [
+                {"text": "first", "start": 24.0, "end": 24.4},
+                {"text": "left", "start": 26.9, "end": 27.1},
+                {"text": "duplicate", "start": 28.0, "end": 28.2},
+            ],
+        },
+        {
+            "chunk_index": 1,
+            "chunk_start_sec": 25.0,
+            "chunk_end_sec": 55.0,
+            "duration_sec": 30.0,
+            "asr_duration_sec": 0.5,
+            "words": [
+                {"text": "duplicate", "start": 26.0, "end": 26.2},
+                {"text": "right", "start": 28.0, "end": 28.3},
+                {"text": "last", "start": 40.0, "end": 40.5},
+            ],
+        },
+    ]
+
+    merged = merge_asr_chunk_payloads(payloads)
+
+    assert merged["text"] == "first left right last"
+    assert merged["duration_sec"] == 55.0
+    assert merged["asr_duration_sec"] == 0.9
+    assert [word["text"] for word in merged["words"]] == ["first", "left", "right", "last"]
+
+
+def test_build_transcription_child_signatures_uses_chunked_asr_and_full_file_optional_stages():
+    signatures = build_transcription_child_signatures(
+        job_id="job_1",
+        normalized_object_key="artifacts/job_1/normalized.wav",
+        chunks=[
+            {
+                "index": 0,
+                "object_key": "artifacts/job_1/chunks/000000.wav",
+                "start_sec": 0.0,
+                "end_sec": 30.0,
+                "duration_sec": 30.0,
+            },
+            {
+                "index": 1,
+                "object_key": "artifacts/job_1/chunks/000001.wav",
+                "start_sec": 25.0,
+                "end_sec": 55.0,
+                "duration_sec": 30.0,
+            },
+        ],
+        diarization=True,
+        num_speakers=None,
+        min_speakers=1,
+        max_speakers=3,
+        duration_sec=55.0,
+    )
+
+    assert [signature.task for signature in signatures] == [
+        "run_asr",
+        "run_asr",
+        "run_emotions",
+        "run_diarization",
+    ]
+    assert signatures[0].args == ("job_1", "artifacts/job_1/chunks/000000.wav", True, 30.0)
+    assert signatures[0].kwargs == {"chunk_index": 0, "chunk_start_sec": 0.0, "chunk_end_sec": 30.0}
+    assert signatures[1].kwargs == {"chunk_index": 1, "chunk_start_sec": 25.0, "chunk_end_sec": 55.0}
+    assert signatures[2].args == ("job_1", "artifacts/job_1/normalized.wav", 55.0)
+    assert signatures[3].args == ("job_1", "artifacts/job_1/normalized.wav", None, 1, 3)
+
+
+def test_aggregate_transcription_job_merges_chunked_asr_results(monkeypatch):
+    async def run():
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        Session = async_sessionmaker(bind=engine, expire_on_commit=False)
+        monkeypatch.setattr(transcription, "SessionLocal", Session)
+
+        try:
+            async with Session() as session:
+                upload = await create_upload(
+                    session,
+                    upload_id="upload_chunked",
+                    object_key="uploads/upload_chunked/audio.wav",
+                    filename="audio.wav",
+                    content_type="audio/wav",
+                    size_bytes=2048,
+                    expires_at=utc_now(),
+                )
+                job = await create_job(
+                    session,
+                    job_id="job_chunked",
+                    upload_id=upload.id,
+                    diarization=False,
+                    num_speakers=None,
+                    min_speakers=None,
+                    max_speakers=None,
+                )
+                await upsert_task_result(
+                    session,
+                    job_id=job.id,
+                    task_type="asr_manifest",
+                    status="completed",
+                    payload={
+                        "duration_sec": 55.0,
+                        "chunks": [
+                            {"index": 0, "start_sec": 0.0, "end_sec": 30.0},
+                            {"index": 1, "start_sec": 25.0, "end_sec": 55.0},
+                        ],
+                    },
+                )
+                await upsert_task_result(
+                    session,
+                    job_id=job.id,
+                    task_type="asr:000000",
+                    status="completed",
+                    payload={
+                        "chunk_index": 0,
+                        "chunk_start_sec": 0.0,
+                        "chunk_end_sec": 30.0,
+                        "duration_sec": 30.0,
+                        "asr_duration_sec": 0.4,
+                        "words": [
+                            {"text": "hello", "start": 1.0, "end": 1.2},
+                            {"text": "old", "start": 28.0, "end": 28.3},
+                        ],
+                    },
+                    exec_duration=0.4,
+                )
+                await upsert_task_result(
+                    session,
+                    job_id=job.id,
+                    task_type="asr:000001",
+                    status="completed",
+                    payload={
+                        "chunk_index": 1,
+                        "chunk_start_sec": 25.0,
+                        "chunk_end_sec": 55.0,
+                        "duration_sec": 30.0,
+                        "asr_duration_sec": 0.5,
+                        "words": [
+                            {"text": "new", "start": 28.0, "end": 28.3},
+                            {"text": "world", "start": 40.0, "end": 40.2},
+                        ],
+                    },
+                    exec_duration=0.5,
+                )
+                await upsert_task_result(
+                    session,
+                    job_id=job.id,
+                    task_type="emotions",
+                    status="completed",
+                    payload={"emotions": {"neutral": 0.8}, "emotions_duration_sec": 0.2},
+                    exec_duration=0.2,
+                )
+
+            complete = await transcription._aggregate_transcription_job("job_chunked")
+            async with Session() as session:
+                loaded = await get_job(session, "job_chunked")
+        finally:
+            await engine.dispose()
+
+        assert complete is True
+        assert loaded.status == "completed"
+        assert loaded.result.text == "hello new world"
+        assert loaded.result.duration_sec == 55.0
+        assert loaded.result.diagnostics["asr_duration_sec"] == 0.9
+        assert loaded.result.diagnostics["emotions"] == {"neutral": 0.8}
+
+    asyncio.run(run())

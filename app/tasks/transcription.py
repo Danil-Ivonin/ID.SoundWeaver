@@ -4,12 +4,13 @@ from time import perf_counter
 
 import torch
 import torchaudio
+from celery import chord, group
 from celery.exceptions import Retry
 
 from app.alignment import SpeakerSegment, WordTimestamp, build_utterances
 from app.asr.gigaam_service import GigaAMEmotionService, GigaAMService, clear_cuda_state
 from app.async_utils import run_sync
-from app.audio.processing import normalize_audio
+from app.audio.processing import build_chunk_windows, normalize_audio, save_audio_chunk
 from app.db.repositories import (
     claim_job_processing,
     get_job,
@@ -24,6 +25,9 @@ from app.errors import AppError, ErrorCode
 from app.settings import get_settings
 from app.storage.minio import AsyncS3Storage
 from app.tasks.celery_app import celery_app
+
+ASR_TASK_PREFIX = "asr:"
+ASR_MANIFEST_TASK_TYPE = "asr_manifest"
 
 
 class TorchaudioProcessor:
@@ -165,6 +169,86 @@ def _word_from_payload(payload: dict) -> WordTimestamp:
         start=float(payload["start"]),
         end=float(payload["end"]),
     )
+
+
+def _offset_word(word: WordTimestamp, offset_sec: float) -> WordTimestamp:
+    return WordTimestamp(
+        text=word.text,
+        start=round(word.start + offset_sec, 6),
+        end=round(word.end + offset_sec, 6),
+    )
+
+
+def _asr_chunk_task_type(chunk_index: int) -> str:
+    return f"{ASR_TASK_PREFIX}{chunk_index:06d}"
+
+
+def merge_asr_chunk_payloads(payloads: list[dict]) -> dict:
+    chunks = sorted(payloads, key=lambda payload: payload["chunk_index"])
+    if not chunks:
+        return {"text": "", "words": [], "duration_sec": 0.0, "asr_duration_sec": 0.0}
+
+    boundaries = []
+    for left, right in zip(chunks, chunks[1:], strict=False):
+        left_end = float(left["chunk_end_sec"])
+        right_start = float(right["chunk_start_sec"])
+        boundaries.append((left_end + right_start) / 2 if left_end > right_start else right_start)
+
+    merged_words = []
+    for index, chunk in enumerate(chunks):
+        lower_bound = boundaries[index - 1] if index > 0 else float("-inf")
+        upper_bound = boundaries[index] if index < len(boundaries) else float("inf")
+        for word in chunk.get("words", []):
+            start = float(word["start"])
+            end = float(word["end"])
+            center = (start + end) / 2
+            if lower_bound <= center < upper_bound:
+                merged_words.append({"text": word["text"], "start": start, "end": end})
+
+    merged_words.sort(key=lambda word: (word["start"], word["end"]))
+    return {
+        "text": " ".join(word["text"] for word in merged_words).strip(),
+        "words": merged_words,
+        "duration_sec": max(float(chunk["chunk_end_sec"]) for chunk in chunks),
+        "asr_duration_sec": round(sum(float(chunk.get("asr_duration_sec", 0.0)) for chunk in chunks), 3),
+    }
+
+
+def build_transcription_child_signatures(
+    *,
+    job_id: str,
+    normalized_object_key: str,
+    chunks: list[dict],
+    diarization: bool,
+    num_speakers: int | None,
+    min_speakers: int | None,
+    max_speakers: int | None,
+    duration_sec: float,
+) -> list:
+    signatures = [
+        run_asr.s(
+            job_id,
+            chunk["object_key"],
+            True,
+            chunk["duration_sec"],
+            chunk_index=chunk["index"],
+            chunk_start_sec=chunk["start_sec"],
+            chunk_end_sec=chunk["end_sec"],
+        )
+        for chunk in chunks
+    ]
+    signatures.append(run_emotions.s(job_id, normalized_object_key, duration_sec))
+    if diarization:
+        signatures.append(
+            run_diarization.s(
+                job_id,
+                normalized_object_key,
+                num_speakers,
+                min_speakers,
+                max_speakers,
+            )
+        )
+    return signatures
 
 
 def _segment_to_payload(segment: SpeakerSegment) -> dict:
@@ -516,34 +600,55 @@ async def _prepare_transcription_job(job_id: str) -> None:
         normalized_path = work_dir / "normalized.wav"
         await storage.download_to_file(object_key, input_path)
         audio = normalize_audio(input_path, normalized_path, settings.max_audio_duration_sec)
-        result = await run_transcription_pipeline_async(
+        normalized_object_key = storage.build_normalized_artifact_key(job_id)
+        await storage.upload_file(normalized_path, normalized_object_key)
+
+        chunks = []
+        for window in build_chunk_windows(
+            duration_sec=audio.duration_sec,
+            chunk_duration_sec=settings.transcription_chunk_duration_sec,
+            chunk_stride_sec=settings.transcription_chunk_stride_sec,
+        ):
+            chunk_path = work_dir / f"chunk_{window['index']:06d}.wav"
+            chunk_audio = save_audio_chunk(
+                audio,
+                chunk_path,
+                start_sec=window["start_sec"],
+                end_sec=window["end_sec"],
+            )
+            chunk_object_key = storage.build_audio_chunk_artifact_key(job_id, window["index"])
+            await storage.upload_file(chunk_path, chunk_object_key)
+            chunks.append(
+                {
+                    "index": window["index"],
+                    "object_key": chunk_object_key,
+                    "start_sec": window["start_sec"],
+                    "end_sec": window["end_sec"],
+                    "duration_sec": chunk_audio.duration_sec,
+                }
+            )
+
+        await _record_task_success(
             job_id,
-            audio=audio,
-            diarization_enabled=diarization,
+            ASR_MANIFEST_TASK_TYPE,
+            {
+                "chunks": chunks,
+                "duration_sec": audio.duration_sec,
+                "chunk_duration_sec": settings.transcription_chunk_duration_sec,
+                "chunk_stride_sec": settings.transcription_chunk_stride_sec,
+            },
+        )
+        child_signatures = build_transcription_child_signatures(
+            job_id=job_id,
+            normalized_object_key=normalized_object_key,
+            chunks=chunks,
+            diarization=diarization,
             num_speakers=num_speakers,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
-            asr=GigaAMService.get_cached(settings.gigaam_model),
-            emotion_model=GigaAMEmotionService.get_cached(),
-            diarization_service=(
-                PyannoteDiarizationService.get_cached(
-                    settings.pyannote_model,
-                    settings.hf_token,
-                    settings.device,
-                )
-                if diarization
-                else None
-            ),
+            duration_sec=audio.duration_sec,
         )
-    async with SessionLocal() as session:
-        await mark_job_completed(
-            session,
-            job_id=job_id,
-            duration_sec=result["duration_sec"],
-            text=result["text"],
-            utterances=result["utterances"],
-            diagnostics=result["diagnostics"],
-        )
+        chord(group(child_signatures), aggregate_transcription_job.s(job_id)).apply_async()
 
 
 @celery_app.task(name="prepare_transcription_job")
@@ -557,8 +662,17 @@ def prepare_transcription_job(job_id: str) -> None:
 
 
 @celery_app.task(name="run_asr")
-def run_asr(job_id: str, normalized_object_key: str, word_timestamps: bool, duration_sec: float) -> dict:
-    task_type = "asr"
+def run_asr(
+    job_id: str,
+    normalized_object_key: str,
+    word_timestamps: bool,
+    duration_sec: float,
+    *,
+    chunk_index: int | None = None,
+    chunk_start_sec: float = 0.0,
+    chunk_end_sec: float | None = None,
+) -> dict:
+    task_type = _asr_chunk_task_type(chunk_index) if chunk_index is not None else "asr"
     exec_duration = None
     try:
         assert_cuda_available()
@@ -574,12 +688,21 @@ def run_asr(job_id: str, normalized_object_key: str, word_timestamps: bool, dura
                 duration_sec=duration_sec,
             )
             exec_duration = round(perf_counter() - started_at, 3)
+        payload_words = [_word_to_payload(_offset_word(word, chunk_start_sec)) for word in words]
         payload = {
             "text": text,
-            "words": [_word_to_payload(word) for word in words],
+            "words": payload_words,
             "duration_sec": duration_sec,
             "asr_duration_sec": exec_duration,
         }
+        if chunk_index is not None:
+            payload.update(
+                {
+                    "chunk_index": chunk_index,
+                    "chunk_start_sec": chunk_start_sec,
+                    "chunk_end_sec": chunk_end_sec if chunk_end_sec is not None else chunk_start_sec + duration_sec,
+                }
+            )
         run_sync(_record_task_success(job_id, task_type, payload, exec_duration))
         return {"task_type": task_type, "status": "completed"}
     except AppError as exc:
@@ -636,7 +759,7 @@ def run_diarization(
 
 
 @celery_app.task(name="run_emotions")
-def run_emotions(job_id: str, normalized_object_key: str) -> dict:
+def run_emotions(job_id: str, normalized_object_key: str, duration_sec: float) -> dict:
     task_type = "emotions"
     exec_duration = None
     try:
@@ -670,12 +793,6 @@ async def _aggregate_transcription_job(job_id: str) -> bool:
             return True
 
         results = await get_task_results(session, job_id)
-        required = {"asr", "emotions"}
-        if job.diarization:
-            required.add("diarization")
-        if not required.issubset(results):
-            return False
-
         failed = [result for result in results.values() if result.status == "failed"]
         if failed:
             first = failed[0]
@@ -687,7 +804,29 @@ async def _aggregate_transcription_job(job_id: str) -> bool:
             )
             return True
 
-        asr_payload = results["asr"].payload
+        required = {"emotions"}
+        if job.diarization:
+            required.add("diarization")
+        if ASR_MANIFEST_TASK_TYPE in results:
+            manifest_payload = results[ASR_MANIFEST_TASK_TYPE].payload
+            chunk_count = len(manifest_payload.get("chunks", []))
+            required.update(_asr_chunk_task_type(index) for index in range(chunk_count))
+        else:
+            required.add("asr")
+        if not required.issubset(results):
+            return False
+
+        if ASR_MANIFEST_TASK_TYPE in results:
+            asr_payload = merge_asr_chunk_payloads(
+                [
+                    results[_asr_chunk_task_type(index)].payload
+                    for index in range(len(results[ASR_MANIFEST_TASK_TYPE].payload.get("chunks", [])))
+                ]
+            )
+            asr_duration_sec = asr_payload.get("asr_duration_sec", 0.0)
+        else:
+            asr_payload = results["asr"].payload
+            asr_duration_sec = results["asr"].exec_duration or asr_payload.get("asr_duration_sec", 0.0)
         emotion_payload = results["emotions"].payload
         words = [_word_from_payload(item) for item in asr_payload.get("words", [])]
         segments = []
@@ -700,7 +839,7 @@ async def _aggregate_transcription_job(job_id: str) -> bool:
         utterances = build_utterances(words, segments) if segments else []
         diagnostics = {
             "device": get_settings().device,
-            "asr_duration_sec": results["asr"].exec_duration or asr_payload.get("asr_duration_sec", 0.0),
+            "asr_duration_sec": asr_duration_sec,
             "diarization_duration_sec": (
                 results["diarization"].exec_duration or diarization_duration_sec
                 if job.diarization

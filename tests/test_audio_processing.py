@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from app.audio.processing import normalize_audio
+from app.audio.processing import build_chunk_windows, normalize_audio
 from app.errors import AppError, ErrorCode
 
 torch = pytest.importorskip("torch")
@@ -33,3 +33,19 @@ def test_normalize_audio_rejects_duration_above_limit(tmp_path: Path):
         normalize_audio(input_path, output_path, max_duration_sec=1)
 
     assert exc_info.value.code == ErrorCode.AUDIO_DURATION_EXCEEDED
+
+
+def test_build_chunk_windows_uses_overlap_stride():
+    windows = build_chunk_windows(duration_sec=80.0, chunk_duration_sec=30, chunk_stride_sec=25)
+
+    assert windows == [
+        {"index": 0, "start_sec": 0.0, "end_sec": 30.0},
+        {"index": 1, "start_sec": 25.0, "end_sec": 55.0},
+        {"index": 2, "start_sec": 50.0, "end_sec": 80.0},
+    ]
+
+
+def test_build_chunk_windows_keeps_short_audio_as_single_chunk():
+    windows = build_chunk_windows(duration_sec=12.5, chunk_duration_sec=30, chunk_stride_sec=25)
+
+    assert windows == [{"index": 0, "start_sec": 0.0, "end_sec": 12.5}]

@@ -2,7 +2,7 @@ from botocore.exceptions import ClientError
 import pytest
 
 from app.settings import Settings
-from app.storage.minio import AsyncS3Storage, build_object_key
+from app.storage.minio import AsyncS3Storage, build_audio_chunk_artifact_key, build_object_key
 
 
 class FakeS3Client:
@@ -46,6 +46,12 @@ def test_build_object_key_sanitizes_filename():
     key = build_object_key("upload_1", "../my meeting.wav")
 
     assert key == "uploads/upload_1/my_meeting.wav"
+
+
+def test_build_audio_chunk_artifact_key_pads_chunk_index():
+    key = build_audio_chunk_artifact_key("job_1", 7)
+
+    assert key == "artifacts/job_1/chunks/000007.wav"
 
 
 @pytest.mark.anyio

@@ -22,7 +22,7 @@ def clear_cuda_state() -> None:
 
 
 class GigaAMService:
-    LONGFORM_THRESHOLD_SEC = 30.0
+    LONGFORM_THRESHOLD_SEC = 25.0
     _instances: dict[str, "GigaAMService"] = {}
     _lock = Lock()
 

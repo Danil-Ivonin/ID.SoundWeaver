@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     device: str = "cuda"
 
     max_audio_duration_sec: int = Field(default=3600, ge=1)
+    transcription_chunk_duration_sec: int = Field(default=30, ge=1)
+    transcription_chunk_stride_sec: int = Field(default=25, ge=1)
     presigned_upload_ttl_sec: int = Field(default=900, ge=60)
 
     @computed_field
